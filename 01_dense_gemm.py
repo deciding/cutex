@@ -12,13 +12,16 @@ RUN_TESTS = [
     # "dense_gemm_2",
     # "dense_gemm_3",
     # "dense_gemm_4",
-    #"dense_gemm_5",
-    "persistent",
-    #"prefetch",
-    #"software_pipeline",
-    #"2sm",
-    #"cute_pipeline",
+    # "dense_gemm_5",
+    # "persistent",
+    # "prefetch",
+    # "software_pipeline",
+    # "2sm",
+    # "cute_pipeline",
+    "dense_gemm_6",
 ]
+
+
 
 from datetime import datetime
 from modal import Image, App, Volume
@@ -413,6 +416,22 @@ def run_dense_gemm():
         time_ms = us / 1000
         tflops = flops / time_ms / 1e9
         print(f"cute_pipeline: {time_ms:.4f} ms, {tflops:.2f} TFLOPS")
+
+    # 13. dense_gemm_6.py (dense_gemm_5 + Persistent)
+    if "dense_gemm_6" in RUN_TESTS:
+        print("\n=== 13. dense_gemm_6.py Benchmark ===")
+        from cuteDSL.blackwell.dense_gemm_6 import run_dense_gemm as run_dense_gemm_6
+
+        us = run_dense_gemm_6(
+            (M, N, K),
+            tolerance=0.1,
+            warmup_iterations=warmup,
+            iterations=repeats,
+            skip_ref_check=False,
+        )
+        time_ms = us / 1000
+        tflops6 = flops / time_ms / 1e9
+        print(f"dense_gemm_6: {time_ms:.4f} ms, {tflops6:.2f} TFLOPS")
 
     print(f"\nDone! Results saved to: {DUMP_DIR}")
 
