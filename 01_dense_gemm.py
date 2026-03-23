@@ -12,7 +12,12 @@ RUN_TESTS = [
     # "dense_gemm_2",
     # "dense_gemm_3",
     # "dense_gemm_4",
-    "dense_gemm_5",
+    #"dense_gemm_5",
+    "persistent",
+    #"prefetch",
+    #"software_pipeline",
+    #"2sm",
+    #"cute_pipeline",
 ]
 
 from datetime import datetime
@@ -35,7 +40,8 @@ cutlass_image = (
         "dpkg -i cuda-keyring_1.1-1_all.deb",
         "apt-get update",
     )
-    .apt_install("cuda-toolkit-12-6")
+    #.apt_install("cuda-toolkit-12-6")
+    .apt_install("cuda-toolkit-13-1")
     .workdir("/workspace")
 )
 
@@ -267,6 +273,146 @@ def run_dense_gemm():
 
         print(f"\nHTML viewers generated!")
         print(f"to download and view: modal volume get {VOLUME_NAME} {dump_name}")
+
+    # 8. dense_gemm_persistent.py
+    if "persistent" in RUN_TESTS:
+        print("\n=== 8. dense_gemm_persistent.py Benchmark ===")
+        from cuteDSL.blackwell.dense_gemm_persistent import run as run_persistent
+
+        us = run_persistent(
+            (M, N, K, 1),
+            ab_dtype=cutlass.Float16,
+            c_dtype=cutlass.Float16,
+            acc_dtype=cutlass.Float32,
+            a_major="k",
+            b_major="k",
+            c_major="n",
+            mma_tiler_mn=(256, 256),
+            cluster_shape_mn=(2, 1),
+            use_2cta_instrs=True,
+            use_tma_store=True,
+            tolerance=0.1,
+            warmup_iterations=warmup,
+            iterations=repeats,
+            skip_ref_check=False,
+            use_cold_l2=False,
+            benchmark=True,
+        )
+        time_ms = us / 1000
+        tflops = flops / time_ms / 1e9
+        print(f"persistent: {time_ms:.4f} ms, {tflops:.2f} TFLOPS")
+
+    # 9. dense_gemm_persistent_prefetch.py
+    if "prefetch" in RUN_TESTS:
+        print("\n=== 9. dense_gemm_persistent_prefetch.py Benchmark ===")
+        from cuteDSL.blackwell.dense_gemm_persistent_prefetch import run as run_prefetch
+
+        us = run_prefetch(
+            (M, N, K, 1),
+            ab_dtype=cutlass.Float16,
+            c_dtype=cutlass.Float16,
+            acc_dtype=cutlass.Float32,
+            a_major="k",
+            b_major="k",
+            c_major="n",
+            mma_tiler_mn=(256, 256),
+            cluster_shape_mn=(2, 1),
+            use_2cta_instrs=True,
+            use_tma_store=True,
+            tolerance=0.1,
+            warmup_iterations=warmup,
+            iterations=repeats,
+            skip_ref_check=False,
+            use_cold_l2=False,
+            benchmark=True,
+        )
+        time_ms = us / 1000
+        tflops = flops / time_ms / 1e9
+        print(f"prefetch: {time_ms:.4f} ms, {tflops:.2f} TFLOPS")
+
+    # 10. dense_gemm_software_pipeline.py
+    if "software_pipeline" in RUN_TESTS:
+        print("\n=== 10. dense_gemm_software_pipeline.py Benchmark ===")
+        from cuteDSL.blackwell.dense_gemm_software_pipeline import run as run_swp
+
+        us = run_swp(
+            (M, N, K, 1),
+            ab_dtype=cutlass.Float16,
+            c_dtype=cutlass.Float16,
+            acc_dtype=cutlass.Float32,
+            a_major="k",
+            b_major="k",
+            c_major="n",
+            mma_tiler_mn=(256, 256),
+            cluster_shape_mn=(2, 1),
+            use_2cta_instrs=True,
+            use_tma_store=True,
+            tolerance=0.1,
+            warmup_iterations=warmup,
+            iterations=repeats,
+            skip_ref_check=False,
+            use_cold_l2=False,
+            benchmark=True,
+        )
+        time_ms = us / 1000
+        tflops = flops / time_ms / 1e9
+        print(f"software_pipeline: {time_ms:.4f} ms, {tflops:.2f} TFLOPS")
+
+    # 11. dense_gemm_2sm.py
+    if "2sm" in RUN_TESTS:
+        print("\n=== 11. dense_gemm_2sm.py Benchmark ===")
+        from cuteDSL.blackwell.dense_gemm_2sm import run as run_2sm
+
+        us = run_2sm(
+            (M, N, K, 1),
+            ab_dtype=cutlass.Float16,
+            c_dtype=cutlass.Float16,
+            acc_dtype=cutlass.Float32,
+            a_major="k",
+            b_major="k",
+            c_major="n",
+            mma_tiler_mn=(256, 256),
+            cluster_shape_mn=(2, 1),
+            use_2cta_instrs=True,
+            use_tma_store=True,
+            tolerance=0.1,
+            warmup_iterations=warmup,
+            iterations=repeats,
+            skip_ref_check=False,
+            use_cold_l2=False,
+            benchmark=True,
+        )
+        time_ms = us / 1000
+        tflops = flops / time_ms / 1e9
+        print(f"2sm: {time_ms:.4f} ms, {tflops:.2f} TFLOPS")
+
+    # 12. dense_gemm_cute_pipeline.py
+    if "cute_pipeline" in RUN_TESTS:
+        print("\n=== 12. dense_gemm_cute_pipeline.py Benchmark ===")
+        from cuteDSL.blackwell.dense_gemm_cute_pipeline import run as run_cute_p
+
+        us = run_cute_p(
+            (M, N, K, 1),
+            ab_dtype=cutlass.Float16,
+            c_dtype=cutlass.Float16,
+            acc_dtype=cutlass.Float32,
+            a_major="k",
+            b_major="k",
+            c_major="n",
+            mma_tiler_mn=(256, 256),
+            cluster_shape_mn=(2, 1),
+            use_2cta_instrs=True,
+            use_tma_store=True,
+            tolerance=0.1,
+            warmup_iterations=warmup,
+            iterations=repeats,
+            skip_ref_check=False,
+            use_cold_l2=False,
+            benchmark=True,
+        )
+        time_ms = us / 1000
+        tflops = flops / time_ms / 1e9
+        print(f"cute_pipeline: {time_ms:.4f} ms, {tflops:.2f} TFLOPS")
 
     print(f"\nDone! Results saved to: {DUMP_DIR}")
 
