@@ -104,7 +104,7 @@ def kernel(
     smem = cutlass.utils.SmemAllocator()
     storage = smem.allocate(SharedStorage)
     # sA: SMEM tensor with shape ((128,16),1,4,1) = (MMA_atom, MMA_M_tiles, MMA_K_tiles, stages)
-    # My Notation: ((128,16),1,4,1) = per_mma_atom((128,16)), per_tma_tile(1,4), per_wave(1)
+    # My Notation: ((128,16),1,4,1) = mma_atom, *res_tma_tile, P
     #     smem_desc is one descriptor for the whole block (128, 16)
     sA = smem.allocate_tensor(
         element_type=io_dtype,
@@ -113,7 +113,7 @@ def kernel(
         swizzle=a_smem_layout.inner,
     )
     # sB: SMEM tensor with shape ((256,16),1,4,1)
-    # My Notation: ((256,16),1,4,1) = per_mma_atom((256,16)), per_tma_tile(1,4), per_wave(1)
+    # My Notation: ((256,16),1,4,1) = mma_atom, *res_tma_tile, P
     #     smem_desc is one descriptor for the whole block (256, 16)
     sB = smem.allocate_tensor(
         element_type=io_dtype,
@@ -171,42 +171,46 @@ def kernel(
 
     # Partition tensors for MMA and make fragments
     # gA: (M_tile, K_tile, K_rest) = (128, 64, 16) for M=N=K=1024, tile=(128,256,64)
+    # ((M_tile, K_tile), RestM, RestK) -> (coordM, None) -> ((M_tile, K_tile), RestK)
+    # Notation: *tma_tile, K
     gA = cute.local_tile(mA_mkl, mma_tiler_mnk, mma_coord_mnk, proj=(1, None, 1))
-    # gB: (N_tile, K_tile, K_rest) = (256, 64, 16)
+    # Notation: *tma_tile, K
     gB = cute.local_tile(mB_nkl, mma_tiler_mnk, mma_coord_mnk, proj=(None, 1, 1))
-    # gC: (M_tile, N_tile) = (128, 256)
+    # Notation: *tma_tile/*block_tile
     gC = cute.local_tile(mC_mnl, mma_tiler_mnk, mma_coord_mnk, proj=(1, 1, None))
     thr_mma = tiled_mma.get_slice(0)
     # (MMA_atom, MMA_M_tiles, MMA_K_tiles, RestK)
-    # My Notation: = per_mma_atom, per_tma_tile, per_tide
+    # My Notation: = mma_atom, *res_tma_tile, K
     tCgA = thr_mma.partition_A(gA)
     # (MMA_atom, MMA_N_tiles, MMA_K_tiles, RestK)
-    # My Notation: = per_mma_atom, per_tma_tile, per_tide
+    # My Notation: = mma_atom, *res_tma_tile, K
     tCgB = thr_mma.partition_B(gB)
     # (MMA_atom, MMA_M_tiles, MMA_N_tiles) = ((128,256),1,1)
-    # My Notation: = per_mma_atom, per_tma_tile
+    # My Notation: = mma_atom, *res_tma_tile
     tCgC = thr_mma.partition_C(gC)
     # tCrA: MMA fragment for A (smem_desc), derived from sA's smem_desc (128,16)
     #        shape (1,1,4,1) = (1 descriptor for whole block, MMA_M_tiles, MMA_K_tiles, stages)
-    # My Notation: (1,1,4,1) = per_mma_atom(1), per_tma_tile(1,4), per_wave(1)
+    # My Notation: (1,1,4,1) = mma_desc_atom, *res_tma_tile, K
     tCrA = tiled_mma.make_fragment_A(sA)
     # tCrB: MMA fragment for B (smem_desc), derived from sB's smem_desc (256,16)
     #        shape (1,1,4,1) = (1 descriptor for whole block, MMA_N_tiles, MMA_K_tiles, stages)
-    # My Notation: (1,1,4,1) = per_mma_atom(1), per_tma_tile(1,4), per_wave(1)
+    # My Notation: (1,1,4,1) = mma_desc_atom, *res_tma_tile, K
     tCrB = tiled_mma.make_fragment_B(sB)
     # (MMA_atom, MMA_M_tiles, MMA_N_tiles)
     acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
     # tCtAcc: MMA accumulator fragment, shape ((128,256),1,1) = (MMA_atom, MMA_M_tiles, MMA_N_tiles)
-    # My Notation: ((128,256),1,1) = per_mma_atom((128,256)), per_tma_tile(1,1)
+    # My Notation: ((128, 256),1,1) = mma_atom, *res_tma_tile
     tCtAcc = tiled_mma.make_fragment_C(acc_shape)
+    # https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html
+    # CU_TENSOR_MAP_SWIZZLE_128B* require the bounding box inner dimension to be <= 128.
     # Partition tensors for TMA; This requires the tensors partitioned for MMA
     # tAsA: TMA address descriptor for SMEM A, shape ((8192,1),1)
     #        = (total_elements_per_stage, num_tma_instructions, stages)
     #        # inner dim K=64 × 2 bytes = 128B, with 128B swizzle = 1 TMA instruction
-    # My Notation: ((8192,1),1) = (per_tma_atom(8192), per_tma_tile(1)), per_wave(1)
+    # My Notation: ((8192,1),1) = (tma_atom, res_tma_tile), P = tma_tile, P
     # tAgA: GMEM address tensor for A, shape (((64,128),1),MMA_K_tiles) = (transposed MMA_atom, MMA_tiles, RestK)
     #        # MMA_K_tiles = number of MMA instructions
-    # My Notation: (((64,128),1),4) = per_tma_atom((64,128)), per_tma_tile(1), per_tide(4)
+    # My Notation: (((64,128),1),4) = (tma_atom, res_tma_tile), K = tma_tile, K
     # def tma_partition(atom, cta_coord, cta_layout, smem_tensor, gmem_tensor) -> (smem_desc, gmem_desc)
     # NOTE: tma_partition requires input tensors folded in shape (Each_Iter, Num_Iters)
     tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
@@ -217,9 +221,9 @@ def kernel(
         cute.group_modes(tCgA, 0, 3),  # gmem_tensor: GMEM tensor grouped for A
     )
     # tBsB: SMEM address tensor for B
-    # My Notation: ((8192,1),1) = (per_tma_atom(8192), per_tma_tile(1)), per_wave(1)
+    # My Notation: (((64,128),1),4) = (tma_atom, res_tma_tile), P = tma_tile, P
     # tBgB: GMEM address tensor for B
-    # My Notation: (((64,128),1),4) = per_tma_atom((64,128)), per_tma_tile(1), per_tide(4)
+    # My Notation: (((64,128),1),4) = (tma_atom, res_tma_tile), K = tma_tile, K
     tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
         tma_atom_b,  # atom: TMA Copy Atom
         0,  # cta_coord: CTA coordinate
@@ -242,20 +246,23 @@ def kernel(
     epi_tiler = (
         (cute.size(tCtAcc, mode=[0, 0]), cute.size(tCtAcc, mode=[0, 1]) // subtile_cnt),
     )
+    #epi_tiler = ((128, 64),)
+    # tCtAcc: ((128, 256),1,1) = mma_atom, *res_tma_tile
     # epi_tiler: ((128,64)) = subtile (each thread processes 64 columns)
     # tCtAcc_epi: (((128,64)),((1,4),1,1)) = (EpiTile, NumTiles)
     #   - EpiTile = (128, 64) - subtile size: 128 rows x 64 columns
     #   - NumTiles = ((1,4),1,1) = (tiles_in_MMA_atom, MMA_M_tiles, MMA_K_tiles)
-    # My Notation: (((128,64)),((1,4),1,1)) = per_tmem_tile((128,64)), per_mma_tile((1,4)) per_tma_tile(1,1)
+    # My Notation: (((128,64)),((1,4),1,1)) = epi_tile, (res_mma_tile, *res_tma_tile)
     tCtAcc_epi = cute.zipped_divide(tCtAcc, epi_tiler)
     # gC_epi: (((128,64)),((1,4),1,1)) = (EpiTile, NumTiles)
     #   - Same structure as tCtAcc_epi but for global memory layout
-    # My Notation: (((128,64)),((1,4),1,1)) = per_tmem_tile((128,64)), per_mma_tile((1,4)) per_tma_tile(1,1)
+    # My Notation: (((128,64)),((1,4),1,1)) = epi_tile, (res_mma_tile, *res_tma_tile)
     gC_epi = cute.zipped_divide(tCgC, epi_tiler)
 
     # TMEM copy atom: loads 32x32 blocks with x64 repetition (64 elements per instruction)
     # Every thread loads 64 columns per iteration (32 elements * 2 for x64 repetition)
     tmem_atom = cute.make_copy_atom(
+        #tcgen05.Ld16x64bOp(tcgen05.Repetition.x16),
         tcgen05.Ld32x32bOp(tcgen05.Repetition.x64),
         cutlass.Float32,
     )
@@ -264,28 +271,28 @@ def kernel(
     # Get thread slice of the tiled copy
     tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
 
-    # tDtC: (((64,32),1),1,((1,4),1,1)) = (TmemCpy, NumTmemCpy, NumTiles)
+    # tTRtC: (((64,32),1),1,((1,4),1,1)) = (TmemCpy, NumTmemCpy, NumTiles)
     #   - TmemCpy = (64, 32) - each thread's local tile: 64 rows x 32 cols
     #   - NumTmemCpy = 1 - one copy instruction per tile
     #   - NumTiles = ((1,4),1,1) = tile layout in the epilogue
     #   - partitioned from tCtAcc_epi: (((128,64)),((1,4),1,1))
-    # My Notation: (((64,32),1),1,((1,4),1,1)) = per_tmem_atom((64,32)), per_tmem_tile(1), per_mma_tile((1,4)) per_tma_tile(1,1)
-    tDtC = tmem_thr_copy.partition_S(tCtAcc_epi)
-    # tDgC: ((64,1),1,((1,4),1,1)) = (TmemCpy, NumTmemCpy, NumTiles)
+    # My Notation: (((64,32),1),1,((1,4),1,1)) = tmem_atom, res_epi_tile, (res_mma_tile, *res_tma_tile)
+    tTRtC = tmem_thr_copy.partition_S(tCtAcc_epi)
+
+    # tTRgC: ((64,1),1,((1,4),1,1)) = (TmemCpy, NumTmemCpy, NumTiles)
     #   - TmemCpy = (64, 1) - destination tile in global memory
     #   - partitioned from gC_epi: (((128,64)),((1,4),1,1))
-    # My Notation: ((64,1),1,((1,4),1,1)) = per_tmem_atom((64,1)), per_tmem_tile(1), per_mma_tile((1,4)) per_tma_tile(1,1)
-    tDgC = tmem_thr_copy.partition_D(gC_epi)
-
+    # My Notation: ((64,1),1,((1,4),1,1)) = tmem_atom, res_epi_tile, (res_mma_tile, *res_tma_tile)
+    tTRgC = tmem_thr_copy.partition_D(gC_epi)
     # tCrAcc: ((64,1),1) = register tensor for accumulator (acc_dtype = Float32)
-    #   - Shape from tDgC[None, None, 0].shape = ((64,1),1)
+    #   - Shape from tTRgC[None, None, 0].shape = ((64,1),1)
     #   - Each thread holds 64 float32 values (one column of the subtile)
-    # My Notation: ((64,1),1) = per_tmem_atom((64,1)), per_tmem_tile(1)
-    tCrAcc = cute.make_rmem_tensor(tDgC[None, None, 0].shape, acc_dtype)
+    # My Notation: ((64,1),1) = tmem_atom, res_epi_tile
+    tCrAcc = cute.make_rmem_tensor(tTRgC[None, None, 0].shape, acc_dtype)
     # tCrC: ((64,1),1) = register tensor for output (io_dtype = Float16)
     #   - Same shape as tCrAcc but different dtype (convert to output dtype)
-    # My Notation: ((64,1),1) = per_tmem_atom((64,1)), per_tmem_tile(1)
-    tCrC = cute.make_rmem_tensor(tDgC[None, None, 0].shape, io_dtype)
+    # My Notation: ((64,1),1) = tmem_atom, res_epi_tile
+    tCrC = cute.make_rmem_tensor(tTRgC[None, None, 0].shape, io_dtype)
 
     #
     # 2. Main loop
@@ -302,8 +309,8 @@ def kernel(
             # TMA loads
             cute.copy(
                 tma_atom_a,
-                tAgA[(None, k_tile_idx)],
-                tAsA[(None, 0)],
+                tAgA[(None, k_tile_idx)], # Notation: tma_atom
+                tAsA[(None, 0)], # Notation: tma_atom, stage = 1
                 tma_bar_ptr=ab_mbar_full,
             )
             cute.copy(
@@ -325,12 +332,12 @@ def kernel(
             # Execute one K-block worth of MMA instructions
             num_k_blocks = cute.size(tCrA, mode=[2])
             for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                k_block_coord = (None, None, k_block_idx, 0)
+                k_block_coord = (None, None, k_block_idx, 0) # mma_atom, res_tma_tile_m/n, res_tma_tile_k, P
                 cute.gemm(
                     tiled_mma,
-                    tCtAcc,
-                    tCrA[k_block_coord],
-                    tCrB[k_block_coord],
+                    tCtAcc, # mma_atom, *res_tma_tile
+                    tCrA[k_block_coord], # mma_atom, res_tma_tile_m
+                    tCrB[k_block_coord], # mma_atom, res_tma_tile_n
                     tCtAcc,
                 )
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
@@ -359,15 +366,15 @@ def kernel(
 
     # Epilogue: TMEM -> Register -> Global Memory
     # Sub-tiling: iterate over 4 subtiles (subtile_cnt = 4) for better ILP
-    #   - tDtC has 4 tiles in mode[2] (N dimension: 64 * 4 = 256 total columns)
+    #   - tTRtC has 4 tiles in mode[2] (N dimension: 64 * 4 = 256 total columns)
     # Loop over each subtile:
-    #   1. Copy from TMEM (tDtC) to register (tCrAcc) - Float32
+    #   1. Copy from TMEM (tTRtC) to register (tCrAcc) - Float32
     #   2. Convert to output dtype and store to register (tCrC) - Float16
-    #   3. Copy from register (tCrC) to global memory (tDgC) - Float16
-    for i in cutlass.range(cute.size(tDtC, mode=[2])):
-        cute.copy(tmem_tiled_copy, tDtC[None, None, i], tCrAcc)  # TMEM -> Reg (Float32)
+    #   3. Copy from register (tCrC) to global memory (tTRgC) - Float16
+    for i in cutlass.range(cute.size(tTRtC, mode=[2])): # res_mma_tile * res_tma_tile
+        cute.copy(tmem_tiled_copy, tTRtC[None, None, i], tCrAcc)  # TMEM -> Reg (Float32)
         tCrC.store(tCrAcc.load().to(io_dtype))  # Convert to Float16
-        cute.autovec_copy(tCrC, tDgC[None, None, i])  # Reg -> Global (Float16)
+        cute.autovec_copy(tCrC, tTRgC[None, None, i])  # Reg -> Global (Float16)
 
     # Deallocate TMEM
     pipeline.sync(barrier_id=1)
@@ -391,8 +398,7 @@ def host_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, stream):
     # Construct SMEM layouts for A and B
     # make_smem_layout_a(tiled_mma, mma_tiler_mnk, a_dtype, num_stages)
     #   ├─> tiled_mma.partition_shape_A()  # Get partitioned shape (M, N, K partitions per CTA)
-    #   │   # Returns: ((M_part, N_part, K_part), M_tile, N_tile, K_tile)
-    #   │   # e.g., for 64x128 tile: ((1,2,1), 64, 64, 128)
+    #   │   # Returns: ((M_part, K_part), M_tile, K_tile)
     #   │
     #   ├─> get_smem_layout_atom_ab()  # Heuristic selection
     #   │   │   # Based on major_mode (K or MN), dtype width, and major_mode_size_bits
@@ -584,6 +590,7 @@ def run_dense_gemm(
         compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
         compare(a_torch_cpu, b_torch_cpu, c_torch_gpu, c_dtype, tolerance)
 
+    return 1000
     workspace_count = 1
     exec_time = testing.benchmark(
         compiled_gemm,
