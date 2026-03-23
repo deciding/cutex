@@ -228,8 +228,8 @@ def kernel(
         tma_atom_b,  # atom: TMA Copy Atom
         0,  # cta_coord: CTA coordinate
         cute.make_layout(1),  # cta_layout: CTA layout
-        cute.group_modes(sB, 0, 3),  # smem_tensor: SMEM tensor grouped for B
-        cute.group_modes(tCgB, 0, 3),  # gmem_tensor: GMEM tensor grouped for B
+        cute.group_modes(sB[(None, None), None, None, None], 0, 4),  # smem_tensor: SMEM tensor grouped for B
+        cute.group_modes(tCgB[(None, None), None, None, None], 0, 4),  # gmem_tensor: GMEM tensor grouped for B
     )
 
     # CTA-wide sync before retrieving the pointer to the start of the allocated TMEM
@@ -246,17 +246,15 @@ def kernel(
     epi_tiler = (
         (cute.size(tCtAcc, mode=[0, 0]), cute.size(tCtAcc, mode=[0, 1]) // subtile_cnt)
     )
-    #epi_tiler = ((128, 64),)
+    #epi_tiler = (128, 64)
     # tCtAcc: ((128, 256),1,1) = mma_atom, *res_tma_tile
-    # epi_tiler: ((128,64)) = subtile (each thread processes 64 columns)
-    # tCtAcc_epi: (((128,64)),((1,4),1,1)) = (EpiTile, NumTiles)
-    #   - EpiTile = (128, 64) - subtile size: 128 rows x 64 columns
-    #   - NumTiles = ((1,4),1,1) = (tiles_in_MMA_atom, MMA_M_tiles, MMA_K_tiles)
-    # My Notation: (((128,64)),((1,4),1,1)) = *epi_tile, *res_mma_tile, *res_tma_tile
+    # epi_tiler: (128,64) = subtile (each thread processes 64 columns)
+    # tCtAcc_epi: (128,64,1,4,1,1)
+    # My Notation: (128,64,1,4,1,1) = *epi_tile, *res_mma_tile, *res_tma_tile
     tCtAcc_epi = cute.flat_divide(tCtAcc[(None, None), None, None], epi_tiler)
-    # gC_epi: (((128,64)),((1,4),1,1)) = (EpiTile, NumTiles)
+    # gC_epi: (128,64,1,4,1,1) = (EpiTile, NumTiles)
     #   - Same structure as tCtAcc_epi but for global memory layout
-    # My Notation: (((128,64)),((1,4),1,1)) = *epi_tile, *res_mma_tile, *res_tma_tile
+    # My Notation: (128,64,1,4,1,1) = *epi_tile, *res_mma_tile, *res_tma_tile
     gC_epi = cute.flat_divide(tCgC[(None, None), None, None], epi_tiler)
 
     # TMEM copy atom: loads 32x32 blocks with x64 repetition (64 elements per instruction)
@@ -272,28 +270,19 @@ def kernel(
     tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
 
     # tTRtC: (((64,32),1),1,((1,4),1,1)) = (TmemCpy, NumTmemCpy, NumTiles)
-    #   - TmemCpy = (64, 32) - each thread's local tile: 64 rows x 32 cols
-    #   - NumTmemCpy = 1 - one copy instruction per tile
-    #   - NumTiles = ((1,4),1,1) = tile layout in the epilogue
-    #   - partitioned from tCtAcc_epi: (((128,64)),((1,4),1,1))
-    # My Notation: (((64,32),1),1,((1,4),1,1)) = tmem_atom, *res_epi_tile, *res_mma_tile, *res_tma_tile
+    # tTRtC: (((64,32),1),1,1,1,4,1,1) = (TmemCpy, NumTmemCpy, NumTiles)
+    # My Notation: (((64,32),1),1,1,1,4,1,1) = tmem_atom, *res_epi_tile, *res_mma_tile, *res_tma_tile
     tTRtC = tmem_thr_copy.partition_S(tCtAcc_epi)
+    # (((64,32),1),1,1,(1,4,1,1))
     tTRtC = cute.group_modes(tTRtC, 3, cute.rank(tTRtC))
 
     # Just to get shape
-    # tTRgC: ((64,1),1,((1,4),1,1)) = (TmemCpy, NumTmemCpy, NumTiles)
-    #   - TmemCpy = (64, 1) - destination tile in global memory
-    #   - partitioned from gC_epi: (((128,64)),((1,4),1,1))
-    # My Notation: ((64,1),1,((1,4),1,1)) = tmem_atom, *res_epi_tile, *res_mma_tile, *res_tma_tile
+    # tTRgC: (((64,32),1),1,1,1,4,1,1)
+    # My Notation: (((64,32),1),1,1,1,4,1,1) = tmem_atom, *res_epi_tile, *res_mma_tile, *res_tma_tile
     tTRgC = tmem_thr_copy.partition_D(gC_epi)
-    # tCrAcc: ((64,1),1) = register tensor for accumulator (acc_dtype = Float32)
-    #   - Shape from tTRgC[None, None, 0].shape = ((64,1),1)
-    #   - Each thread holds 64 float32 values (one column of the subtile)
-    # My Notation: ((64,1),1) = tmem_atom, res_epi_tile
+    # tCrAcc: ((64,1),1,1) = register tensor for accumulator (acc_dtype = Float32)
+    # My Notation: ((64,1),1,1) = tmem_atom, *res_epi_tile
     tCrAcc = cute.make_rmem_tensor(tTRgC[None, None, None, 0, 0, 0, 0].shape, acc_dtype)
-    # tCrC: ((64,1),1) = register tensor for output (io_dtype = Float16)
-    #   - Same shape as tCrAcc but different dtype (convert to output dtype)
-    # My Notation: ((64,1),1) = tmem_atom, res_epi_tile
     tCrC = cute.make_rmem_tensor(tTRgC[None, None, None, 0, 0, 0, 0].shape, io_dtype)
     tTRgC = cute.group_modes(tTRgC, 3, cute.rank(tTRgC))
 
