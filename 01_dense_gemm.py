@@ -8,7 +8,7 @@ Tests torch.matmul and dense_gemm with same settings.
 RUN_TESTS = [
     # "torch",
     # "dense_gemm",
-    "dense_gemm_1",
+    #"dense_gemm_1",
     # "dense_gemm_2",
     # "dense_gemm_3",
     # "dense_gemm_4",
@@ -18,7 +18,7 @@ RUN_TESTS = [
     # "software_pipeline",
     # "2sm",
     # "cute_pipeline",
-    # "dense_gemm_6",
+    "dense_gemm_6",
 ]
 
 
