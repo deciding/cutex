@@ -582,7 +582,6 @@ def run_dense_gemm(
         compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
         compare(a_torch_cpu, b_torch_cpu, c_torch_gpu, c_dtype, tolerance)
 
-    return 1000
     workspace_count = 1
     exec_time = testing.benchmark(
         compiled_gemm,
