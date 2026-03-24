@@ -4,23 +4,23 @@ Tests torch.matmul and dense_gemm with same settings.
 """
 
 # Which tests to run - modify this list to choose which tests to execute
-# Available options: "torch", "dense_gemm", "dense_gemm_1", "dense_gemm_2", "dense_gemm_3", "dense_gemm_4", "dense_gemm_5"
+# Available options: "torch", "dense_gemm", "dense_gemm_1", "dense_gemm_2", "dense_gemm_3", "dense_gemm_4", "dense_gemm_5", "dense_gemm_6", "dense_gemm_7"
 RUN_TESTS = [
     # "torch",
-    #"dense_gemm",
-    #"dense_gemm_1",
+    # "dense_gemm",
+    # "dense_gemm_1",
     # "dense_gemm_2",
     # "dense_gemm_3",
     # "dense_gemm_4",
-    #"dense_gemm_5",
-    #"persistent",
+    # "dense_gemm_5",
+    # "dense_gemm_6",
+    "dense_gemm_7",
+    # "persistent",
     # "prefetch",
     # "software_pipeline",
     # "2sm",
     # "cute_pipeline",
-    "dense_gemm_6",
 ]
-
 
 
 from datetime import datetime
@@ -43,7 +43,7 @@ cutlass_image = (
         "dpkg -i cuda-keyring_1.1-1_all.deb",
         "apt-get update",
     )
-    #.apt_install("cuda-toolkit-12-6")
+    # .apt_install("cuda-toolkit-12-6")
     .apt_install("cuda-toolkit-13-1")
     .workdir("/workspace")
 )
@@ -432,6 +432,22 @@ def run_dense_gemm():
         time_ms = us / 1000
         tflops6 = flops / time_ms / 1e9
         print(f"dense_gemm_6: {time_ms:.4f} ms, {tflops6:.2f} TFLOPS")
+
+    # 14. dense_gemm_7.py
+    if "dense_gemm_7" in RUN_TESTS:
+        print("\n=== 14. dense_gemm_7.py Benchmark ===")
+        from cuteDSL.blackwell.dense_gemm_7 import run_dense_gemm as run_dense_gemm_7
+
+        us = run_dense_gemm_7(
+            (M, N, K),
+            tolerance=0.1,
+            warmup_iterations=warmup,
+            iterations=repeats,
+            skip_ref_check=False,
+        )
+        time_ms = us / 1000
+        tflops7 = flops / time_ms / 1e9
+        print(f"dense_gemm_7: {time_ms:.4f} ms, {tflops7:.2f} TFLOPS")
 
     print(f"\nDone! Results saved to: {DUMP_DIR}")
 
