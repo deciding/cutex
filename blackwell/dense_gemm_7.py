@@ -62,19 +62,19 @@ mma_tiler_mnk = (
     64,
 )  # [PAIR-UMMA] Changed from (128, 256, 64) to use CtaGroup.TWO
 
-threads_per_cta = 128
+#threads_per_cta = 128
 
-## [WARP_SPEC]
-#epilogue_warp_id = (0, 1, 2, 3)
-#mma_warp_id = 4
-#tma_warp_id = 5
-#threads_per_cta = 32 * len(
-#    (mma_warp_id, tma_warp_id, *epilogue_warp_id)
-#)
-## Set barrier id for cta sync, epilogue sync and tmem ptr sync
-#epilog_sync_bar_id = 1
-#tmem_alloc_sync_bar_id = 2
-#tmem_dealloc_sync_bar_id = 3
+# [WARP_SPEC]
+epilogue_warp_id = (0, 1, 2, 3)
+mma_warp_id = 4
+tma_warp_id = 5
+threads_per_cta = 32 * len(
+    (mma_warp_id, tma_warp_id, *epilogue_warp_id)
+)
+# Set barrier id for cta sync, epilogue sync and tmem ptr sync
+epilog_sync_bar_id = 1
+tmem_alloc_sync_bar_id = 2
+tmem_dealloc_sync_bar_id = 3
 
 # Pipeline stage configuration
 ab_stages = 6  # TODO: don't hardcode this
@@ -207,8 +207,7 @@ def kernel(
 
     # Prefetch tma descriptor
     # [WARP_SPEC]
-    #if warp_idx == tma_warp_id:
-    if warp_idx == 0:
+    if warp_idx == tma_warp_id:
         cpasync.prefetch_descriptor(tma_atom_a)
         cpasync.prefetch_descriptor(tma_atom_b)
         # [TMEM_STORE] Prefetch C TMA descriptor
@@ -246,7 +245,7 @@ def kernel(
         consumer_group=pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             # [PERSISTENT] producer_acquire/consumer_release uses empty buffer, which is consumer buffer
-            (2 if use_2cta_instrs else 1) * (threads_per_cta // 32),
+            (2 if use_2cta_instrs else 1) * len(epilogue_warp_id),
         ),
         barrier_storage=storage.acc_mbar_ptr.data_ptr(),
         cta_layout_vmnk=cluster_layout_vmnk,
@@ -427,60 +426,46 @@ def kernel(
         tCrAcc = cute.make_rmem_tensor(tDgC[None, None, None, 0, 0, 0, 0].shape, acc_dtype)
         tCrC = cute.make_rmem_tensor(tDgC[None, None, None, 0, 0, 0, 0].shape, io_dtype)
 
-
-    # [PERSISTENT] 2. Outer loop: Persist and process multiple tiles
-    while work_tile.is_valid_tile:
-        # [PERSISTENT] 3. Get the actual tile coordinate for this iteration
-        cur_tile_coord = work_tile.tile_idx
-        mma_coord_mnk = (
-            cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
-            cur_tile_coord[1],
-            None
+    # [CLUSTER] Create multicast masks, 1. tma: whom to mcast 2. mma: whom to arrive
+    # [PAIR-UMMA] Also enable for use_2cta_instrs
+    a_full_mcast_mask = None
+    b_full_mcast_mask = None
+    if cutlass.const_expr(is_a_mcast or is_b_mcast or use_2cta_instrs):
+        a_full_mcast_mask = cpasync.create_tma_multicast_mask(
+            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
+        )
+        b_full_mcast_mask = cpasync.create_tma_multicast_mask(
+            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
         )
 
-        tAgA_slice = tAgA[
-            (None, mma_coord_mnk[0], mma_coord_mnk[2])
-        ]
-        # ((atom_v, rest_v), RestK)
-        tBgB_slice = tBgB[
-            (None, mma_coord_mnk[1], mma_coord_mnk[2])
-        ]
-        #
-        # 2. Main loop
-        #
+    num_k_tiles = cute.size(gA, mode=[3])
 
-        # [CLUSTER] Create multicast masks, 1. tma: whom to mcast 2. mma: whom to arrive
-        # [PAIR-UMMA] Also enable for use_2cta_instrs
-        a_full_mcast_mask = None
-        b_full_mcast_mask = None
-        if cutlass.const_expr(is_a_mcast or is_b_mcast or use_2cta_instrs):
-            a_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
-            )
-            b_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
+    # [WARP_SPEC] TMA Load
+    if warp_idx == tma_warp_id:
+
+        # [PERSISTENT] 2. Outer loop: Persist and process multiple tiles
+        while work_tile.is_valid_tile:
+            # [PERSISTENT] 3. Get the actual tile coordinate for this iteration
+            cur_tile_coord = work_tile.tile_idx
+            mma_coord_mnk = (
+                cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
+                cur_tile_coord[1],
+                None
             )
 
-        num_k_tiles = cute.size(gA, mode=[3])
-
-        if warp_idx == 0:
-            # Wait for a empty accumulator buffer
-            # [PERSISTENT] producer acquire uses empty buffer, which is consumer buffer
-            if is_leader_cta:
-                acc_pipeline.producer_acquire(acc_producer_state)
+            tAgA_slice = tAgA[
+                (None, mma_coord_mnk[0], mma_coord_mnk[2])
+            ]
+            # ((atom_v, rest_v), RestK)
+            tBgB_slice = tBgB[
+                (None, mma_coord_mnk[1], mma_coord_mnk[2])
+            ]
 
             # [PERSISTENT]
             # should reset the count for gmem, but keep the index for smem
-            ab_consumer.reset()
             ab_producer.reset()
-            #
-            # [PERSISTENT]
-            # Reset the ACCUMULATE field for each tile
-            #
-            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-            # MMA mainloop
-            for k_tile_idx in cutlass.range(num_k_tiles, prefetch_stages=ab_stages - 2):
+            for k_tile in cutlass.range(num_k_tiles, unroll=1):
                 # Issue TMA loads
                 ab_empty = ab_producer.acquire_and_advance()
                 cute.copy(
@@ -497,6 +482,39 @@ def kernel(
                     tma_bar_ptr=ab_empty.barrier,
                     mcast_mask=b_full_mcast_mask,  # mcast
                 )
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
+        ab_producer.tail()
+
+
+    # [WARP_SPEC] MMA
+    if warp_idx == mma_warp_id:
+        while work_tile.is_valid_tile:
+            # [PERSISTENT] 3. Get the actual tile coordinate for this iteration
+            cur_tile_coord = work_tile.tile_idx
+            mma_coord_mnk = (
+                cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
+                cur_tile_coord[1],
+                None
+            )
+
+            # Wait for a empty accumulator buffer
+            # [PERSISTENT] producer acquire uses empty buffer, which is consumer buffer
+            if is_leader_cta:
+                acc_pipeline.producer_acquire(acc_producer_state)
+
+            # [PERSISTENT]
+            # should reset the count for gmem, but keep the index for smem
+            ab_consumer.reset()
+            #
+            # [PERSISTENT]
+            # Reset the ACCUMULATE field for each tile
+            #
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
+            # MMA mainloop
+            for k_tile_idx in cutlass.range(num_k_tiles):
 
                 if is_leader_cta:
                     # Execute one K-block worth of MMA instructions
@@ -521,80 +539,101 @@ def kernel(
                 acc_pipeline.producer_commit(acc_producer_state)
             acc_producer_state.advance()
 
-        #
-        # 3. Epilogue
-        #
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
 
-        # Wait for the accumulator buffer to be full
-        acc_pipeline.consumer_wait(acc_consumer_state)
+        acc_pipeline.producer_tail(acc_producer_state)
 
 
-        # [PERSISTENT] 4. Advance and Reset state for next tile
-        tile_sched.advance_to_next_work() # pre load for calculating executed tiles
-        work_tile = tile_sched.get_current_work()
+    # [WARP_SPEC] Epilogue
+    if warp_idx < mma_warp_id:
+        epilog_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=epilog_sync_bar_id,
+            num_threads=32 * len(epilogue_warp_id),
+        )
 
-        if cutlass.const_expr(use_tma_store):
-            # (EPI_TILE_M, EPI_TILE_N), (EPI_M, EPI_N)
-            bSG_gC_tile = bSG_gC[None, None, None, mma_coord_mnk[0], mma_coord_mnk[1]]
-            bSG_gC_tile = cute.group_modes(bSG_gC_tile, 1, cute.rank(bSG_gC_tile))
+        while work_tile.is_valid_tile:
+            # [PERSISTENT] 3. Get the actual tile coordinate for this iteration
+            cur_tile_coord = work_tile.tile_idx
+            mma_coord_mnk = (
+                cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
+                cur_tile_coord[1],
+                None
+            )
 
-            # [TMEM_STORE] TMEM -> Register -> SMEM -> GMEM (TMA Store)
-            # (T2R, T2R_M, T2R_N, EPI_MN)
-            subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-            for subtile_idx in cutlass.range(subtile_cnt):
-                # TMEM -> Register
-                # index missing consumer_state
-                tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
-                cute.copy(tmem_tiled_copy, tTR_tAcc_mn, tTR_rAcc)
+            # Wait for the accumulator buffer to be full
+            acc_pipeline.consumer_wait(acc_consumer_state)
 
-                # Apply epilogue op and convert to output dtype
-                acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                tRS_rC.store(acc_vec.to(io_dtype))
 
-                # Register -> SMEM
-                # [PERSISTENT] c_buffer
-                num_tiles_executed = tile_sched.num_tiles_executed
-                num_prev_subtiles = num_tiles_executed * subtile_cnt
-                c_buffer = (num_prev_subtiles + subtile_idx) % num_c_stage
-                cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
-                # fence between smem store and tma store
-                cute.arch.fence_proxy("async.shared", space="cta")
-                pipeline.sync(barrier_id=1)
+            # [PERSISTENT] 4. Advance and Reset state for next tile
+            tile_sched.advance_to_next_work() # pre load for calculating executed tiles
+            work_tile = tile_sched.get_current_work()
 
-                # TMA Store C to global memory
-                if warp_idx == 0:
-                    cute.copy(
-                        tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC_tile[(None, subtile_idx)]
-                    )
-                    # Fence and barrier to make sure TMA store is completed to recollect C buffer
-                    # PipelineTmaStore do not accept state
-                    c_pipeline.producer_commit()
-                    c_pipeline.producer_acquire()
-                pipeline.sync(barrier_id=1)
+            if cutlass.const_expr(use_tma_store):
+                # (EPI_TILE_M, EPI_TILE_N), (EPI_M, EPI_N)
+                bSG_gC_tile = bSG_gC[None, None, None, mma_coord_mnk[0], mma_coord_mnk[1]]
+                bSG_gC_tile = cute.group_modes(bSG_gC_tile, 1, cute.rank(bSG_gC_tile))
 
-            # PipelineTmaStore: cute.arch.cp_async_bulk_wait_group(0, read=True, loc=loc, ip=ip)
-            c_pipeline.producer_tail()
+                # [TMEM_STORE] TMEM -> Register -> SMEM -> GMEM (TMA Store)
+                # (T2R, T2R_M, T2R_N, EPI_MN)
+                subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                for subtile_idx in cutlass.range(subtile_cnt):
+                    # TMEM -> Register
+                    # index missing consumer_state
+                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                    cute.copy(tmem_tiled_copy, tTR_tAcc_mn, tTR_rAcc)
 
-        else:
-            # [SIMT-STORE] TMEM -> Register -> GMEM (SIMT Store)
-            simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), io_dtype)
-            tDtC = cute.group_modes(tDtC, 3, cute.rank(tDtC))
-            tDgC = cute.group_modes(tDgC, 3, cute.rank(tDgC))
-            for i in cutlass.range(cute.size(tDtC, mode=[3])):
-                cute.copy(tmem_tiled_copy, tDtC[None, None, None, i], tCrAcc)
-                tCrC.store(tCrAcc.load().to(io_dtype))
-                cute.copy(simt_atom, tCrC, tDgC[(None, None, None, i)])
+                    # Apply epilogue op and convert to output dtype
+                    acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                    tRS_rC.store(acc_vec.to(io_dtype))
 
-        with cute.arch.elect_one():
-            acc_pipeline.consumer_release(acc_consumer_state)
-        acc_consumer_state.advance()
+                    # Register -> SMEM
+                    # [PERSISTENT] c_buffer
+                    num_tiles_executed = tile_sched.num_tiles_executed
+                    num_prev_subtiles = num_tiles_executed * subtile_cnt
+                    c_buffer = (num_prev_subtiles + subtile_idx) % num_c_stage
+                    cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
+                    # fence between smem store and tma store
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    #pipeline.sync(barrier_id=1)
+                    epilog_sync_barrier.arrive_and_wait()
 
-    # Wait for C store complete
-    acc_pipeline.producer_tail(acc_producer_state)
-    # Deallocate TMEM
-    pipeline.sync(barrier_id=1)
-    tmem.relinquish_alloc_permit()
-    tmem.free(tmem_ptr)
+                    # TMA Store C to global memory
+                    if warp_idx == 0:
+                        cute.copy(
+                            tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC_tile[(None, subtile_idx)]
+                        )
+                        # Fence and barrier to make sure TMA store is completed to recollect C buffer
+                        # PipelineTmaStore do not accept state
+                        c_pipeline.producer_commit()
+                        c_pipeline.producer_acquire()
+                    #pipeline.sync(barrier_id=1)
+                    epilog_sync_barrier.arrive_and_wait()
+
+            else:
+                # [SIMT-STORE] TMEM -> Register -> GMEM (SIMT Store)
+                simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), io_dtype)
+                tDtC = cute.group_modes(tDtC, 3, cute.rank(tDtC))
+                tDgC = cute.group_modes(tDgC, 3, cute.rank(tDgC))
+                for i in cutlass.range(cute.size(tDtC, mode=[3])):
+                    cute.copy(tmem_tiled_copy, tDtC[None, None, None, i], tCrAcc)
+                    tCrC.store(tCrAcc.load().to(io_dtype))
+                    cute.copy(simt_atom, tCrC, tDgC[(None, None, None, i)])
+
+            # TODO: not tested for non-tma-store
+            with cute.arch.elect_one():
+                acc_pipeline.consumer_release(acc_consumer_state)
+            acc_consumer_state.advance()
+
+        # PipelineTmaStore: cute.arch.cp_async_bulk_wait_group(0, read=True, loc=loc, ip=ip)
+        # TODO: only end of all?
+        c_pipeline.producer_tail()
+
+
+        # Deallocate TMEM
+        #pipeline.sync(barrier_id=1)
+        tmem.relinquish_alloc_permit()
+        tmem.free(tmem_ptr)
 
 
 
