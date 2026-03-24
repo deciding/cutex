@@ -28,6 +28,7 @@ Step 3: Added TMA Store for direct SMEM->GMEM stores.
 
 import argparse
 from typing import Tuple, Optional, Union
+from functools import lru_cache
 
 import cutlass
 import cutlass.cute as cute
@@ -432,6 +433,16 @@ def kernel(
             if is_leader_cta:
                 acc_pipeline.producer_acquire(acc_producer_state)
 
+            # [PERSISTENT]
+            # should reset the count for gmem, but keep the index for smem
+            ab_consumer.reset()
+            ab_producer.reset()
+            #
+            # [PERSISTENT]
+            # Reset the ACCUMULATE field for each tile
+            #
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
             # MMA mainloop
             for k_tile_idx in cutlass.range(num_k_tiles, prefetch_stages=ab_stages - 2):
                 # Issue TMA loads
@@ -481,6 +492,11 @@ def kernel(
         # Wait for the accumulator buffer to be full
         acc_pipeline.consumer_wait(acc_consumer_state)
 
+
+        # [PERSISTENT] 4. Advance and Reset state for next tile
+        tile_sched.advance_to_next_work() # pre load for calculating executed tiles
+        work_tile = tile_sched.get_current_work()
+
         if cutlass.const_expr(use_tma_store):
             # [TMEM_STORE] TMEM -> Register -> SMEM -> GMEM (TMA Store)
             # (T2R, T2R_M, T2R_N, EPI_MN)
@@ -516,6 +532,7 @@ def kernel(
                     c_pipeline.producer_acquire()
                 pipeline.sync(barrier_id=1)
 
+            # PipelineTmaStore: cute.arch.cp_async_bulk_wait_group(0, read=True, loc=loc, ip=ip)
             c_pipeline.producer_tail()
 
         else:
@@ -532,10 +549,6 @@ def kernel(
             acc_pipeline.consumer_release(acc_consumer_state)
         acc_consumer_state.advance()
 
-        # [PERSISTENT] 4. Advance and Reset state for next tile
-        tile_sched.advance_to_next_work()
-        work_tile = tile_sched.get_current_work()
-
     # Wait for C store complete
     acc_pipeline.producer_tail(acc_producer_state)
     # Deallocate TMEM
@@ -546,7 +559,11 @@ def kernel(
 
 
 @cute.jit
-def host_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, max_active_clusters, stream):
+def host_function(
+        a: cute.Tensor, b: cute.Tensor, c: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+        ):
     # Construct tiled MMA
     # [PAIR-UMMA] Simpler way to create than tcgen05.MmaF16BF16Op and make_tiled_mma
     tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -807,6 +824,21 @@ def run_dense_gemm(
         )
         return testing.JitArguments(a_tensor, b_tensor, c_tensor, current_stream)
 
+    @lru_cache(maxsize=1)
+    def compile_mm(
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr = None,
+    ):
+        from cutlass.cute.runtime import make_fake_stream
+
+        stream = make_fake_stream()
+        return cute.compile(
+            host_function, a, b, c, max_active_clusters, stream
+        )
+
+
     a_tensor, b_tensor, c_tensor, a_torch_cpu, b_torch_cpu, c_torch_cpu, c_torch_gpu = (
         create_tensors(l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype)
     )
@@ -819,9 +851,10 @@ def run_dense_gemm(
     max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
-    compiled_gemm = cute.compile(
-        host_function, a_tensor, b_tensor, c_tensor, max_active_clusters, current_stream
-    )
+    #compiled_gemm = cute.compile(
+    #    host_function, a_tensor, b_tensor, c_tensor, max_active_clusters, current_stream
+    #)
+    compiled_gemm = compile_mm(a_tensor, b_tensor, c_tensor, max_active_clusters)
 
     def compare(a_torch_cpu, b_torch_cpu, c_torch_gpu, c_dtype, tolerance):
         import torch
@@ -849,7 +882,8 @@ def run_dense_gemm(
         )
 
     if not skip_ref_check:
-        compiled_gemm(a_tensor, b_tensor, c_tensor, max_active_clusters, current_stream)
+        #compiled_gemm(a_tensor, b_tensor, c_tensor, max_active_clusters, current_stream)
+        compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
         compare(a_torch_cpu, b_torch_cpu, c_torch_gpu, c_dtype, tolerance)
 
     workspace_count = 1

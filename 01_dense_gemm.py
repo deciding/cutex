@@ -7,13 +7,13 @@ Tests torch.matmul and dense_gemm with same settings.
 # Available options: "torch", "dense_gemm", "dense_gemm_1", "dense_gemm_2", "dense_gemm_3", "dense_gemm_4", "dense_gemm_5"
 RUN_TESTS = [
     # "torch",
-    # "dense_gemm",
+    #"dense_gemm",
     #"dense_gemm_1",
     # "dense_gemm_2",
     # "dense_gemm_3",
     # "dense_gemm_4",
-    # "dense_gemm_5",
-    # "persistent",
+    #"dense_gemm_5",
+    #"persistent",
     # "prefetch",
     # "software_pipeline",
     # "2sm",
