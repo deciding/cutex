@@ -50,7 +50,21 @@ from flash_attn.cute.cute_dsl_utils import (
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
 from .flash_fwd_sm100 import FlashAttentionForwardSm100
+from .flash_fwd_sm100_simple import FlashAttentionForwardSm100Simple as Fa100Simple
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+
+# Router to switch between original and simple implementations
+# Set USE_SIMPLE_FA4=1 in environment to use simple version
+import os
+
+_USE_SIMPLE = os.environ.get("USE_SIMPLE_FA4", "0") == "1"
+
+
+def _get_fa100_class():
+    """Get the appropriate FlashAttentionForwardSm100 class based on environment variable."""
+    return Fa100Simple if _USE_SIMPLE else FlashAttentionForwardSm100
+
+
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
@@ -546,30 +560,37 @@ def _flash_attn_fwd(
                 and head_dim_padded == 128
                 and head_dim_v_padded == 128
             )
-            fa_fwd = FlashAttentionForwardSm100(
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead=qhead_per_kvhead,
-                is_causal=causal,
-                is_local=local,
-                is_split_kv=is_split_kv,
-                pack_gqa=pack_gqa,
-                m_block_size=m_block_size,
-                n_block_size=n_block_size,
-                q_stage=q_stage,
-                is_persistent=not causal
-                and not local
-                and cu_seqlens_q is None
-                and seqused_q is None
-                and not is_split_kv,
-                score_mod=score_mod,
-                mask_mod=mask_mod,
-                has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=page_size not in [None, 128],
-                is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
-                q_subtile_factor=q_subtile_factor,
-                use_2cta_instrs=use_2cta_instrs,
-            )
+            if _USE_SIMPLE:
+                # Simple version - only supports basic config
+                fa_fwd = Fa100Simple(
+                    head_dim=head_dim,
+                    is_causal=causal,
+                )
+            else:
+                fa_fwd = FlashAttentionForwardSm100(
+                    head_dim,
+                    head_dim_v,
+                    qhead_per_kvhead=qhead_per_kvhead,
+                    is_causal=causal,
+                    is_local=local,
+                    is_split_kv=is_split_kv,
+                    pack_gqa=pack_gqa,
+                    m_block_size=m_block_size,
+                    n_block_size=n_block_size,
+                    q_stage=q_stage,
+                    is_persistent=not causal
+                    and not local
+                    and cu_seqlens_q is None
+                    and seqused_q is None
+                    and not is_split_kv,
+                    score_mod=score_mod,
+                    mask_mod=mask_mod,
+                    has_aux_tensors=aux_tensors is not None,
+                    paged_kv_non_tma=page_size not in [None, 128],
+                    is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+                    q_subtile_factor=q_subtile_factor,
+                    use_2cta_instrs=use_2cta_instrs,
+                )
         else:
             raise ValueError(
                 f"Unsupported compute capability: {arch}. Supported: 9.x, 10.x, 11.x"

@@ -45,7 +45,7 @@ fa4_image = (
     timeout=600,
     volumes={"/workspace/dump": volume},
 )
-def run_fa4_benchmark():
+def run_fa4_benchmark(use_simple: bool = False):
     import torch
     import sys
     from typing import NamedTuple
@@ -53,6 +53,13 @@ def run_fa4_benchmark():
     import os
 
     from datetime import datetime
+
+    # Set environment variable BEFORE importing flash_attn
+    if use_simple:
+        os.environ["USE_SIMPLE_FA4"] = "1"
+        print("USE_SIMPLE_FA4")
+    else:
+        os.environ["USE_SIMPLE_FA4"] = "0"
 
     dump_name = "fa4" + "".join(str(datetime.now()).replace(":", ".").split())
     DUMP_DIR = "/workspace/dump/" + dump_name
@@ -190,5 +197,5 @@ def run_fa4_benchmark():
 
 
 @app.local_entrypoint()
-def main():
-    run_fa4_benchmark.remote()
+def main(use_simple: bool = True):
+    run_fa4_benchmark.remote(use_simple=use_simple)
