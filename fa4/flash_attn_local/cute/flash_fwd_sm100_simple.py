@@ -910,6 +910,16 @@ class FlashAttentionForwardSm100Simple:
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
+        pipeline_kv.producer_tail(kv_producer_state)
+        # This is equivalent to pipeline_q.producer_tail
+        if (
+            const_expr(len(self.load_warp_ids) == 1)
+            or warp_idx == self.load_warp_ids[0]
+        ):
+            pipeline_q.producer_acquire_w_index_phase(
+                self.q_stage - 1, q_producer_phase
+            )
+
     @cute.jit
     def mma(
         self,
