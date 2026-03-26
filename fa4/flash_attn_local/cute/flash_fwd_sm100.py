@@ -1362,6 +1362,7 @@ class FlashAttentionForwardSm100:
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
+        bidx, bidy, bidz = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         q_producer_phase = Int32(1)
         kv_producer_state = pipeline.make_pipeline_state(
@@ -1483,6 +1484,10 @@ class FlashAttentionForwardSm100:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, m_block, split_idx, num_splits
                 )
+                if tidx == 0 and bidx==2 and bidy==0 and bidz==0:
+                    cute.printf("n_block_min: {}\n", n_block_min)
+                    cute.printf("n_block_max: {}\n", n_block_max)
+
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                     page_idx = (

@@ -58,7 +58,7 @@ class FlashAttentionForwardSm100Simple:
         n_block_size: int = 128,
         q_stage: int = 2,
         is_persistent: bool = True,
-        use_2cta_instrs: bool = True,
+        use_2cta_instrs: bool = False,  # Disabled for debugging
     ):
         hdim_multiple_of = 16
         self.head_dim_padded = int(
@@ -670,8 +670,7 @@ class FlashAttentionForwardSm100Simple:
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             stage = Int32(
                 0
-                if const_expr(self.q_stage == 1)
-                or warp_idx < self.softmax1_warp_ids[0]
+                if const_expr(self.q_stage == 1) or warp_idx < self.softmax1_warp_ids[0]
                 else 1
             )
             self.softmax(
@@ -720,7 +719,6 @@ class FlashAttentionForwardSm100Simple:
                 TileSchedulerCls,
             )
 
-
     def load_Q(
         self,
         load_Q_fn: Callable,
@@ -748,11 +746,11 @@ class FlashAttentionForwardSm100Simple:
         K_or_V: Literal["K", "V"],
     ):
         stage, phase = producer_state.index, producer_state.phase
-        #extra_tx_count = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
-        #extra_kwargs = (
+        # extra_tx_count = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
+        # extra_kwargs = (
         #    {"extra_tx_count": extra_tx_count}
-        #)
-        #pipeline_kv.producer_acquire(producer_state, **extra_kwargs)
+        # )
+        # pipeline_kv.producer_acquire(producer_state, **extra_kwargs)
         pipeline_kv.producer_acquire(producer_state)
 
         tXsX_cur = tXsX[None, stage]
@@ -787,6 +785,8 @@ class FlashAttentionForwardSm100Simple:
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        bidx, bidy, bidz = cute.arch.block_idx()
+
         q_producer_phase = Int32(1)
         kv_producer_state = pipeline.make_pipeline_state(
             pipeline_custom.PipelineUserType.Producer, self.kv_stage
@@ -871,7 +871,6 @@ class FlashAttentionForwardSm100Simple:
                 block=n_block_max - 1,
                 producer_state=kv_producer_state,
             )  # K0
-            kv_producer_state.advance()
 
             if const_expr(
                 len(self.load_warp_ids) == 1 or warp_idx == self.load_warp_ids[0]
@@ -879,8 +878,12 @@ class FlashAttentionForwardSm100Simple:
                 pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
                 tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
                 load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
+            kv_producer_state.advance()
 
-            if const_expr(self.q_stage == 2):
+            if const_expr(
+                self.q_stage == 2
+                and (len(self.load_warp_ids) == 1 or warp_idx == self.load_warp_ids[0])
+            ):
                 pipeline_q.producer_acquire_w_index_phase(1, q_producer_phase)
                 tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(1)
                 load_Q_fn(src_idx=1, dst_idx=1, tma_bar_ptr=tma_bar_ptr)
@@ -996,12 +999,14 @@ class FlashAttentionForwardSm100Simple:
         ]
         # ===PTX===
 
-
         mma_q_consumer_phase = Int32(0)
         mma_kv_consumer_state = pipeline.make_pipeline_state(
             pipeline_custom.PipelineUserType.Consumer, self.kv_stage
         )
         P_full_O_rescaled_phase = Int32(0)
+
+        bidx, bidy, bidz = cute.arch.block_idx()
+        tidx = cute.arch.thread_idx()[0]
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1031,13 +1036,13 @@ class FlashAttentionForwardSm100Simple:
                     tSrKi = tSrK[None, None, None, Ki_index]
                     sK_cur = sK[None, None, None, Ki_index]
 
-                    #sm100_utils.gemm(
+                    # sm100_utils.gemm(
                     #    tiled_mma_qk,
                     #    tStS[None, None, None, stage],
                     #    tSrQ[None, None, None, stage],
                     #    tSrK[None, None, None, tSrKi],
                     #    zero_init=True,
-                    #)
+                    # )
                     gemm_Si[stage](
                         smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(
                             sK_cur.iterator
@@ -1055,11 +1060,9 @@ class FlashAttentionForwardSm100Simple:
                 # Note: Q0 & Q1 are still needed in the seqlen_kv loop
                 # so we need to release them after the seqlen_kv loop
 
-
+                block_loop_count = block_iter_count - 1
                 O_should_accumulate = False
-                for n_block in cutlass.range(
-                    n_block_max - 1, n_block_min - 1, -1, unroll=1
-                ):
+                for i in cutlass.range(block_loop_count, unroll=1):
                     # GEMM_PV00 (P0 * V0 -> O0_partial),
                     # O0 needs to be accumulated in the seqlen_kv loop
                     # 1. wait for V0
@@ -1076,16 +1079,18 @@ class FlashAttentionForwardSm100Simple:
                         # For the first iteration in this work tile, waiting for O0/O1_partial
                         # means that the correction warps has finished reading tO during
                         # the last iteration of the previous work tile.
-                        pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
+                        pipeline_s_p_o.producer_acquire_w_index_phase(
+                            stage, P_full_O_rescaled_phase
+                        )
 
                         # 3. gemm
-                        #sm100_utils.gemm(
+                        # sm100_utils.gemm(
                         #    tiled_mma_pv,
                         #    tOtO[None, None, None, stage],
                         #    tOrP[None, None, None, stage],
                         #    tOrVi,
                         #    zero_init=(not O_should_accumulate),
-                        #)
+                        # )
                         sV_cur = sV[None, None, None, Vi_index]
                         gemm_Pi[stage](
                             tCrB=tOrVi,
@@ -1131,12 +1136,13 @@ class FlashAttentionForwardSm100Simple:
                         # 3. release S0 / S1
                         pipeline_s_p_o.producer_commit_w_index(stage)
                         # End of GEMM_QK0i (Q0 * Ki -> S0)
+
                     # 4. release Ki
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
                     mma_kv_consumer_state.advance()
                     P_full_O_rescaled_phase ^= 1
                     O_should_accumulate = True
-                    mma_kv_consumer_state.advance()
+
                 # End of seqlen_kv loop
 
                 # release Q0 & Q1
@@ -1188,6 +1194,7 @@ class FlashAttentionForwardSm100Simple:
             # Advance to next tile
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
         # End of persistent scheduler loop
 
     @cute.jit
@@ -1202,6 +1209,9 @@ class FlashAttentionForwardSm100Simple:
         TileSchedulerCls: Callable,
         mma_tile_coord_v: Int32 = 0,
     ):
+        bidx, bidy, bidz = cute.arch.block_idx()
+        tidx = cute.arch.thread_idx()[0]
+
         epi_consumer_phase = Int32(0)
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1212,9 +1222,7 @@ class FlashAttentionForwardSm100Simple:
                 seqlen, m_block, split_idx, 1
             )
 
-            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[
-                None, None, head_idx
-            ]
+            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
             tiler_gO = (
                 (self.mma_tiler_pv[0] * self.q_stage),
                 self.head_dim_v_padded,
@@ -1223,9 +1231,9 @@ class FlashAttentionForwardSm100Simple:
             gO = layout_utils.select(
                 cute.flat_divide(gO, (self.mma_tiler_pv[0],)), mode=[0, 2, 1]
             )  # (128, 128, 2)
-            gO = cute.flat_divide(
-                gO, (self.mma_tiler_pv[0] // self.cta_group_size,)
-            )[None, mma_tile_coord_v, None, None]
+            gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[
+                None, mma_tile_coord_v, None, None
+            ]
 
             store_O, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_O, 0, cute.make_layout(1), sO, gO
@@ -1233,17 +1241,13 @@ class FlashAttentionForwardSm100Simple:
             for stage in cutlass.range(self.q_stage, unroll_full=True):
                 # wait from corr, issue tma store on smem
                 # 1. wait for O0 / O1 final
-                pipeline_o_epi.consumer_wait_w_index_phase(
-                    stage, epi_consumer_phase
-                )
+                pipeline_o_epi.consumer_wait_w_index_phase(stage, epi_consumer_phase)
                 # 2. copy O0 / O1 to gmem
                 store_O(src_idx=stage, dst_idx=stage)
                 cute.arch.cp_async_bulk_commit_group()
             for stage in cutlass.range_constexpr(self.q_stage):
                 # Ensure O0 / O1 buffer is ready to be released
-                cute.arch.cp_async_bulk_wait_group(
-                    self.q_stage - 1 - stage, read=True
-                )
+                cute.arch.cp_async_bulk_wait_group(self.q_stage - 1 - stage, read=True)
                 pipeline_o_epi.consumer_release_w_index(stage)
 
             epi_consumer_phase ^= 1
@@ -1271,8 +1275,7 @@ class FlashAttentionForwardSm100Simple:
         TileSchedulerCls,
     ):
         tidx = cute.arch.thread_idx()[0] % (
-            cute.arch.WARP_SIZE
-            * (len(self.softmax0_warp_ids))
+            cute.arch.WARP_SIZE * (len(self.softmax0_warp_ids))
         )
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
@@ -1315,6 +1318,8 @@ class FlashAttentionForwardSm100Simple:
 
         mma_si_consumer_phase = Int32(0)
         sm_stats_producer_phase = Int32(1)
+
+        bidx, bidy, bidz = cute.arch.block_idx()
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1367,9 +1372,7 @@ class FlashAttentionForwardSm100Simple:
             )
             n_block_max -= 1
             # The remaining iterations have no masking (but may still need mask_mod)
-            for n_tile in cutlass.range(
-                n_block_max, unroll=1
-            ):
+            for n_tile in cutlass.range(n_block_max, unroll=1):
                 n_block = n_block_max - n_tile - 1
                 (
                     mma_si_consumer_phase,
@@ -1385,9 +1388,7 @@ class FlashAttentionForwardSm100Simple:
             sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
             if const_expr(mLSE is not None):
                 sScale[
-                    tidx
-                    + stage * self.m_block_size
-                    + self.q_stage * self.m_block_size
+                    tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
                 ] = softmax.row_max[0]
             # pipeline_sm_stats.producer_commit_w_index(stage)
             sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx_in_wg)
@@ -1403,7 +1404,6 @@ class FlashAttentionForwardSm100Simple:
         mma_si_consumer_phase: Int32,
         sm_stats_producer_phase: Int32,
         n_block: Int32,
-
         softmax: SoftmaxSm100,
         thr_mma_qk: cute.core.ThrMma,
         pipeline_s_p_o: pipeline.PipelineAsync,
@@ -1417,7 +1417,6 @@ class FlashAttentionForwardSm100Simple:
         sScale: cute.Tensor,
         stage: int | Int32,
         seqlen,
-
         is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
 
@@ -1547,6 +1546,8 @@ class FlashAttentionForwardSm100Simple:
         ]
         tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
 
+        bidx, bidy, bidz = cute.arch.block_idx()
+
         # First iter: no correction is required
         # Notify mma warp that O has been rescaled
         for stage in cutlass.range(self.q_stage):
@@ -1555,7 +1556,6 @@ class FlashAttentionForwardSm100Simple:
         sm_stats_consumer_phase = Int32(0)
         o_corr_consumer_phase = Int32(0)
         corr_epi_producer_phase = Int32(1)
-
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1568,9 +1568,7 @@ class FlashAttentionForwardSm100Simple:
             )
             total_block_count = n_block_max - n_block_min
 
-            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[
-                None, None, head_idx
-            ]
+            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
 
             tiler_gO = ((self.mma_tiler_pv[0] * self.q_stage), self.head_dim_v_padded)
             gO = cute.local_tile(mO_cur, tiler_gO, (m_block, 0))  # (128 * 2, 128)
@@ -1585,9 +1583,7 @@ class FlashAttentionForwardSm100Simple:
             stats = [
                 (
                     0.0,
-                    -Float32.inf
-                    if const_expr(mLSE is not None)
-                    else None,
+                    -Float32.inf if const_expr(mLSE is not None) else None,
                     True,
                 )
             ] * self.q_stage
@@ -1616,16 +1612,16 @@ class FlashAttentionForwardSm100Simple:
                         )
                     # Notify mma warp that O has been rescaled
                     pipeline_s_p_o.consumer_release_w_index(stage)
-                    pipeline_sm_stats.consumer_release_w_index(
-                        self.q_stage - 1 - stage
-                    )
+                    pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
                 sm_stats_consumer_phase ^= 1
             if const_expr(self.q_stage == 2):
                 pipeline_sm_stats.consumer_release_w_index(1)
             # End of seqlen_corr_loop_steps
 
             for stage in cutlass.range_constexpr(self.q_stage):
-                sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx_in_wg)
+                sm_stats_barrier.arrive_and_wait_w_index(
+                    index=stage * 4 + warp_idx_in_wg
+                )
                 row_sum = sScale[tidx + stage * self.m_block_size]
                 if const_expr(mLSE is not None):
                     row_max = sScale[
@@ -1642,9 +1638,7 @@ class FlashAttentionForwardSm100Simple:
                     row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0
                 )
                 # Wait for the last O to be ready from the MMA warp
-                pipeline_o_acc.consumer_wait_w_index_phase(
-                    stage, o_corr_consumer_phase
-                )
+                pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                 pipeline_o_epi.producer_acquire_w_index_phase(
                     stage, corr_epi_producer_phase
                 )
@@ -1689,15 +1683,19 @@ class FlashAttentionForwardSm100Simple:
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )
-                    seqlen_q = (
-                        seqlen.seqlen_q
-                    )
+                    seqlen_q = seqlen.seqlen_q
                     if tidx < seqlen_q - m_tile_idx * self.m_block_size:
                         # This actually just works with PackGQA too
                         gLSE[tidx] = lse
 
+                corr_tile_count += 1
+
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+        pipeline_o_epi.producer_acquire_w_index_phase(
+            self.q_stage - 1, corr_epi_producer_phase
+        )
 
     @cute.jit
     def correction_rescale(
@@ -1815,4 +1813,3 @@ class FlashAttentionForwardSm100Simple:
                 )
             copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
         cute.arch.fence_view_async_shared()
-

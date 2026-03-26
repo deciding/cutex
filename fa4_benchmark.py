@@ -101,6 +101,11 @@ def run_fa4_benchmark(use_simple: bool = False):
     causal = False
     repeats = 30
 
+    batch_size = 1
+    nheads = 1
+    seqlen_q = 256
+    seqlen_k = 256
+
     print(
         f"\nConfig: batch={batch_size}, heads={nheads}, seq_len={seqlen_q}, head_dim={head_dim}, causal={causal}"
     )
@@ -122,11 +127,16 @@ def run_fa4_benchmark(use_simple: bool = False):
     flash_attn_func_local = interface_local.flash_attn_func
 
     # Warmup
-    for _ in range(5):
+    warmup_iters = 5
+    for i in range(warmup_iters):
         _ = flash_attn_func_local(q, k, v, causal=causal)
+        torch.cuda.synchronize()
+
+    # Run local version and collect output
+    o_local, lse_local = flash_attn_func_local(q, k, v, causal=causal)
     torch.cuda.synchronize()
 
-    # Benchmark
+    # Benchmark timing
     m_local = time_fwd(flash_attn_func_local, q, k, v, causal=causal, repeats=repeats)
     tflops_local = calc_tflops(
         m_local.mean, batch_size, nheads, seqlen_q, seqlen_k, head_dim, causal
@@ -150,7 +160,11 @@ def run_fa4_benchmark(use_simple: bool = False):
         _ = flash_attn_func_pip(q, k, v, causal=causal)
     torch.cuda.synchronize()
 
-    # Benchmark
+    # Run pip version and collect output
+    o_pip, lse_pip = flash_attn_func_pip(q, k, v, causal=causal)
+    torch.cuda.synchronize()
+
+    # Benchmark timing
     m_pip = time_fwd(flash_attn_func_pip, q, k, v, causal=causal, repeats=repeats)
     tflops_pip = calc_tflops(
         m_pip.mean, batch_size, nheads, seqlen_q, seqlen_k, head_dim, causal
@@ -161,13 +175,40 @@ def run_fa4_benchmark(use_simple: bool = False):
 
     # ===== Comparison =====
     print("\n" + "=" * 60)
-    print("=== Comparison ===")
+    print("=== Output Comparison ===")
+    print("=" * 60)
+
+    # Compare outputs
+    diff = o_local - o_pip
+    abs_diff = torch.abs(diff)
+    rel_diff = abs_diff / (torch.abs(o_pip) + 1e-8)
+
+    print(f"Output difference stats:")
+    print(f"  Max absolute diff: {abs_diff.max().item():.6e}")
+    print(f"  Mean absolute diff: {abs_diff.mean().item():.6e}")
+    print(f"  Max relative diff: {rel_diff.max().item():.6e}")
+    print(f"  Mean relative diff: {rel_diff.mean().item():.6e}")
+
+    # Check numerical closeness
+    atol = 1e-2  # Absolute tolerance
+    rtol = 1e-2  # Relative tolerance
+    is_close = torch.allclose(o_local, o_pip, atol=atol, rtol=rtol)
+    print(f"  All close (atol={atol}, rtol={rtol}): {is_close}")
+
+    # Check for NaN/Inf
+    print(f"  Local has NaN: {torch.isnan(o_local).any().item()}")
+    print(f"  Local has Inf: {torch.isinf(o_local).any().item()}")
+    print(f"  Pip has NaN: {torch.isnan(o_pip).any().item()}")
+    print(f"  Pip has Inf: {torch.isinf(o_pip).any().item()}")
+
+    print("\n" + "=" * 60)
+    print("=== Performance Comparison ===")
     print("=" * 60)
     print(f"Local (Mounted): {tflops_local:.2f} TFLOPS")
     print(f"Pip (Official):  {tflops_pip:.2f} TFLOPS")
-    diff = tflops_local - tflops_pip
-    diff_pct = (diff / tflops_pip) * 100 if tflops_pip != 0 else 0
-    print(f"Difference:      {diff:+.2f} TFLOPS ({diff_pct:+.2f}%)")
+    perf_diff = tflops_local - tflops_pip
+    perf_diff_pct = (perf_diff / tflops_pip) * 100 if tflops_pip != 0 else 0
+    print(f"Difference:      {perf_diff:+.2f} TFLOPS ({perf_diff_pct:+.2f}%)")
 
     # Save results
     results_file = "/workspace/dump/fa4_benchmark_results.txt"
@@ -181,7 +222,13 @@ def run_fa4_benchmark(use_simple: bool = False):
         f.write(f"\n")
         f.write(f"Local (Mounted): {tflops_local:.2f} TFLOPS\n")
         f.write(f"Pip (Official):  {tflops_pip:.2f} TFLOPS\n")
-        f.write(f"Difference:      {diff:+.2f} TFLOPS ({diff_pct:+.2f}%)\n")
+        f.write(f"Difference:      {perf_diff:+.2f} TFLOPS ({perf_diff_pct:+.2f}%)\n")
+        f.write(f"\n")
+        f.write(f"Output Comparison:\n")
+        f.write(f"  Max absolute diff: {abs_diff.max().item():.6e}\n")
+        f.write(f"  Mean absolute diff: {abs_diff.mean().item():.6e}\n")
+        f.write(f"  Max relative diff: {rel_diff.max().item():.6e}\n")
+        f.write(f"  All close: {is_close}\n")
 
     print(f"\nResults saved to {results_file}")
 
