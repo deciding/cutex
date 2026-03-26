@@ -564,7 +564,7 @@ def _flash_attn_fwd(
                 # Simple version - only supports basic config
                 fa_fwd = Fa100Simple(
                     head_dim=head_dim,
-                    is_causal=causal,
+                    head_dim_v=head_dim_v,
                 )
             else:
                 fa_fwd = FlashAttentionForwardSm100(
