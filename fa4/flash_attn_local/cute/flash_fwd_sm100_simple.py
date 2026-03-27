@@ -24,6 +24,7 @@ from cutlass.cutlass_dsl import BaseDSL
 from quack import copy_utils, layout_utils
 
 import flash_attn.cute.pipeline as pipeline_custom
+from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import SoftmaxSm100
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -351,6 +352,11 @@ class FlashAttentionForwardSm100Simple:
         LOG2_E = math.log2(math.e)
         softmax_scale_log2 = softmax_scale * LOG2_E
 
+        if const_expr(window_size_left is not None):
+            window_size_left = Int32(window_size_left)
+        if const_expr(window_size_right is not None):
+            window_size_right = Int32(window_size_right)
+
         self.kernel(
             mQ,
             mK,
@@ -363,6 +369,8 @@ class FlashAttentionForwardSm100Simple:
             tma_atom_O,
             softmax_scale_log2,
             softmax_scale,
+            window_size_left,
+            window_size_right,
             sQ_layout,
             sK_layout,
             tP_layout,
@@ -395,6 +403,8 @@ class FlashAttentionForwardSm100Simple:
         tma_atom_O: cute.CopyAtom,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
+        window_size_left: Optional[Int32],
+        window_size_right: Optional[Int32],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
@@ -569,8 +579,8 @@ class FlashAttentionForwardSm100Simple:
             self.is_causal,
             self.is_local,
             self.is_split_kv,
-            None,
-            None,
+            window_size_left,
+            window_size_right,
             qhead_per_kvhead_packgqa=1,
         )
         SeqlenInfoCls = partial(
@@ -581,6 +591,16 @@ class FlashAttentionForwardSm100Simple:
             mCuSeqlensK=None,
             mSeqUsedQ=None,
             mSeqUsedK=None,
+        )
+        AttentionMaskCls = partial(
+            AttentionMask,
+            self.m_block_size,
+            self.n_block_size,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead
+            if const_expr(self.pack_gqa)
+            else 1,
         )
         TileSchedulerCls = partial(
             StaticPersistentTileScheduler.create, tile_sched_params
@@ -687,6 +707,7 @@ class FlashAttentionForwardSm100Simple:
                 sm_stats_barrier,
                 block_info,
                 SeqlenInfoCls,
+                AttentionMaskCls,
                 TileSchedulerCls,
             )
 
@@ -971,6 +992,8 @@ class FlashAttentionForwardSm100Simple:
         sm100_utils.declare_ptx_idesc(qk_mma_op, var_name="fa_fwd_qk_mma_idesc")
         sm100_utils.declare_ptx_idesc(pv_mma_op, var_name="fa_fwd_pv_mma_idesc")
         sQ_stage_stride = (sQ.layout.stride[-1] * sQ.element_type.width // 8) >> 4
+        if const_expr(self.q_stage == 1):
+            sQ_stage_stride = 0
         gemm_Si = [
             partial(
                 sm100_utils.gemm_ptx_precomputed_varname,
@@ -1272,6 +1295,7 @@ class FlashAttentionForwardSm100Simple:
         sm_stats_barrier,
         block_info,
         SeqlenInfoCls,
+        AttentionMaskCls,
         TileSchedulerCls,
     ):
         tidx = cute.arch.thread_idx()[0] % (
@@ -1337,6 +1361,21 @@ class FlashAttentionForwardSm100Simple:
             )
             tile_block_count = n_block_max - n_block_min
 
+            mask = AttentionMaskCls(seqlen)
+            shared_mask_kwargs = dict(
+                m_block=(self.q_stage * m_block + stage) * self.cta_group_size,
+                thr_mma=thr_mma_qk,
+                thr_tmem_load=thr_tmem_load,
+                mask_causal=self.is_causal,
+                mask_local=self.is_local,
+                batch_idx=batch_idx,
+                head_idx=head_idx,
+            )
+            mask_fn = partial(
+                mask.apply_mask_sm100,
+                **shared_mask_kwargs,
+            )
+
             softmax.reset()
 
             softmax_step = partial(
@@ -1369,6 +1408,7 @@ class FlashAttentionForwardSm100Simple:
                 sm_stats_producer_phase,
                 n_block_max - 1,
                 is_first=True,
+                mask_fn=partial(mask_fn, mask_seqlen=True),
             )
             n_block_max -= 1
             # The remaining iterations have no masking (but may still need mask_mod)
@@ -1381,11 +1421,19 @@ class FlashAttentionForwardSm100Simple:
                     mma_si_consumer_phase,
                     sm_stats_producer_phase,
                     n_block,
+                    mask_fn=partial(mask_fn, mask_seqlen=False),
                 )
             # Separate iterations with local masking on the left
 
             # Dense path always writes scale / signals
             sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+            if tidx == 0 and bidx == 0:
+                cute.printf(
+                    "[SOFTMAX stage=%d] row_sum=%f row_max=%f\n",
+                    stage,
+                    softmax.row_sum[0],
+                    softmax.row_max[0],
+                )
             if const_expr(mLSE is not None):
                 sScale[
                     tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
@@ -1418,6 +1466,7 @@ class FlashAttentionForwardSm100Simple:
         stage: int | Int32,
         seqlen,
         is_first: bool = False,
+        mask_fn: Optional[Callable] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
 
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -1437,6 +1486,9 @@ class FlashAttentionForwardSm100Simple:
             thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype
         )
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+
+        if const_expr(mask_fn is not None):
+            mask_fn(tSrS_t2r, n_block=n_block)
 
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
@@ -1459,7 +1511,7 @@ class FlashAttentionForwardSm100Simple:
         softmax.apply_exp2_convert(
             tSrS_t2r,
             tSrP_r2t,
-            ex2_emu_freq=self.ex2_emu_freq,
+            ex2_emu_freq=self.ex2_emu_freq if const_expr(mask_fn is None) else 0,
             ex2_emu_start_frg=self.ex2_emu_start_frg,
         )
 
@@ -1605,6 +1657,13 @@ class FlashAttentionForwardSm100Simple:
                     )
                     scale = sScale[tidx + stage * self.m_block_size]
                     should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
+                    if tidx == 0 and bidx == 0 and stage == 0:
+                        cute.printf(
+                            "[CORRECTION] stage=%d scale=%f should_rescale=%d\n",
+                            stage,
+                            scale,
+                            should_rescale,
+                        )
                     # should_rescale = True
                     if should_rescale:
                         self.correction_rescale(

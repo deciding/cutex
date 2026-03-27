@@ -178,16 +178,55 @@ def run_fa4_benchmark(use_simple: bool = False):
     print("=== Output Comparison ===")
     print("=" * 60)
 
+    # Print sample values from outputs
+    print(f"\nLocal output sample values (first 5 elements):")
+    print(f"  {o_local[0, 0, 0, :5].tolist()}")
+    print(f"Local output shape: {o_local.shape}, dtype: {o_local.dtype}")
+    if lse_local is not None:
+        print(f"Local LSE sample values (first 5):")
+        print(f"  {lse_local[0, 0, :5].tolist()}")
+    else:
+        print(f"Local LSE: None")
+
+    print(f"\nPip output sample values (first 5 elements):")
+    print(f"  {o_pip[0, 0, 0, :5].tolist()}")
+    print(f"Pip output shape: {o_pip.shape}, dtype: {o_pip.dtype}")
+    if lse_pip is not None:
+        print(f"Pip LSE sample values (first 5):")
+        print(f"  {lse_pip[0, 0, :5].tolist()}")
+    else:
+        print(f"Pip LSE: None")
+
     # Compare outputs
     diff = o_local - o_pip
     abs_diff = torch.abs(diff)
     rel_diff = abs_diff / (torch.abs(o_pip) + 1e-8)
 
-    print(f"Output difference stats:")
+    print(f"\nOutput difference stats:")
     print(f"  Max absolute diff: {abs_diff.max().item():.6e}")
     print(f"  Mean absolute diff: {abs_diff.mean().item():.6e}")
     print(f"  Max relative diff: {rel_diff.max().item():.6e}")
     print(f"  Mean relative diff: {rel_diff.mean().item():.6e}")
+
+    # Find where the max difference occurs
+    max_diff_idx = abs_diff.argmax()
+    max_diff_flat_idx = max_diff_idx.item()
+    # Convert flat index to multi-dimensional indices
+    b_idx = max_diff_flat_idx // (
+        o_local.shape[1] * o_local.shape[2] * o_local.shape[3]
+    )
+    h_idx = (
+        max_diff_flat_idx % (o_local.shape[1] * o_local.shape[2] * o_local.shape[3])
+    ) // (o_local.shape[2] * o_local.shape[3])
+    s_idx = (
+        max_diff_flat_idx % (o_local.shape[2] * o_local.shape[3])
+    ) // o_local.shape[3]
+    d_idx = max_diff_flat_idx % o_local.shape[3]
+    print(f"  Max diff location: batch={b_idx}, head={h_idx}, seq={s_idx}, dim={d_idx}")
+    print(
+        f"  Local value at max diff: {o_local[b_idx, h_idx, s_idx, d_idx].item():.6e}"
+    )
+    print(f"  Pip value at max diff: {o_pip[b_idx, h_idx, s_idx, d_idx].item():.6e}")
 
     # Check numerical closeness
     atol = 1e-2  # Absolute tolerance
@@ -200,6 +239,13 @@ def run_fa4_benchmark(use_simple: bool = False):
     print(f"  Local has Inf: {torch.isinf(o_local).any().item()}")
     print(f"  Pip has NaN: {torch.isnan(o_pip).any().item()}")
     print(f"  Pip has Inf: {torch.isinf(o_pip).any().item()}")
+
+    # Compare LSE
+    if lse_local is not None and lse_pip is not None:
+        lse_diff = torch.abs(lse_local - lse_pip)
+        print(f"\nLSE difference stats:")
+        print(f"  Max LSE diff: {lse_diff.max().item():.6e}")
+        print(f"  Mean LSE diff: {lse_diff.mean().item():.6e}")
 
     print("\n" + "=" * 60)
     print("=== Performance Comparison ===")
@@ -220,15 +266,32 @@ def run_fa4_benchmark(use_simple: bool = False):
             f"Config: batch={batch_size}, heads={nheads}, seq_len={seqlen_q}, head_dim={head_dim}, causal={causal}\n"
         )
         f.write(f"\n")
+        f.write(f"=== Performance ===\n")
         f.write(f"Local (Mounted): {tflops_local:.2f} TFLOPS\n")
         f.write(f"Pip (Official):  {tflops_pip:.2f} TFLOPS\n")
         f.write(f"Difference:      {perf_diff:+.2f} TFLOPS ({perf_diff_pct:+.2f}%)\n")
         f.write(f"\n")
-        f.write(f"Output Comparison:\n")
-        f.write(f"  Max absolute diff: {abs_diff.max().item():.6e}\n")
-        f.write(f"  Mean absolute diff: {abs_diff.mean().item():.6e}\n")
-        f.write(f"  Max relative diff: {rel_diff.max().item():.6e}\n")
-        f.write(f"  All close: {is_close}\n")
+        f.write(f"=== Output Sample Values ===\n")
+        f.write(f"Local output[0,0,0,:5]: {o_local[0, 0, 0, :5].tolist()}\n")
+        f.write(f"Pip output[0,0,0,:5]:  {o_pip[0, 0, 0, :5].tolist()}\n")
+        if lse_local is not None:
+            f.write(f"Local LSE[0,0,:5]: {lse_local[0, 0, :5].tolist()}\n")
+        else:
+            f.write(f"Local LSE: None\n")
+        if lse_pip is not None:
+            f.write(f"Pip LSE[0,0,:5]:  {lse_pip[0, 0, :5].tolist()}\n")
+        else:
+            f.write(f"Pip LSE: None\n")
+        f.write(f"\n")
+        f.write(f"=== Output Difference ===\n")
+        f.write(f"Max absolute diff: {abs_diff.max().item():.6e}\n")
+        f.write(f"Mean absolute diff: {abs_diff.mean().item():.6e}\n")
+        f.write(f"Max relative diff: {rel_diff.max().item():.6e}\n")
+        f.write(f"All close (atol=1e-2, rtol=1e-2): {is_close}\n")
+        f.write(f"Local has NaN: {torch.isnan(o_local).any().item()}\n")
+        f.write(f"Local has Inf: {torch.isinf(o_local).any().item()}\n")
+        f.write(f"Pip has NaN: {torch.isnan(o_pip).any().item()}\n")
+        f.write(f"Pip has Inf: {torch.isinf(o_pip).any().item()}\n")
 
     print(f"\nResults saved to {results_file}")
 
