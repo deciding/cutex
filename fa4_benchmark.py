@@ -1,6 +1,6 @@
 """
 Modal script to run FA4 (CuTeDSL) sm100 (Blackwell) benchmark on B200 GPU.
-Compares local (mounted) vs pip (official) versions.
+Compares local (mounted) version against PyTorch reference implementation.
 """
 
 from modal import Image, App, Volume
@@ -36,6 +36,10 @@ fa4_image = (
     .pip_install("flash-attn-4==4.0.0b4")
     .pip_install("teraxlang==3.5.1.dev4")
     .add_local_dir(root_dir / "fa4", remote_path="/workspace/fa4")
+    .add_local_dir(
+        root_dir / "third_party" / "flash-attention",
+        remote_path="/workspace/flash-attention-ref",
+    )
 )
 
 
@@ -48,6 +52,7 @@ fa4_image = (
 def run_fa4_benchmark(use_simple: bool = False):
     import torch
     import sys
+    import math
     from typing import NamedTuple
     from triton.testing import do_bench
     import os
@@ -83,8 +88,41 @@ def run_fa4_benchmark(use_simple: bool = False):
         flops = batch_size * nheads * 2 * seqlen_q * avg_seqlen * (head_dim + head_dim)
         return flops / time_ms / 1e12
 
+    def attention_ref(q, k, v, causal=False, upcast=True):
+        """PyTorch reference implementation of attention."""
+        dtype_og = q.dtype
+        if upcast:
+            q, k, v = q.float(), k.float(), v.float()
+
+        seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+        d = q.shape[-1]
+        softmax_scale = 1.0 / math.sqrt(d)
+
+        scores = torch.einsum("bthd,bshd->bhts", q * softmax_scale, k)
+
+        if causal:
+            # Create causal mask
+            causal_mask = torch.triu(
+                torch.ones(seqlen_q, seqlen_k, dtype=torch.bool, device=q.device),
+                diagonal=1,
+            )
+            scores = scores.masked_fill(causal_mask, float("-inf"))
+
+        attention = torch.softmax(scores, dim=-1).to(
+            dtype_og.dtype if not upcast else torch.float32
+        )
+        output = torch.einsum("bhts,bshd->bthd", attention, v)
+
+        if upcast:
+            output = output.to(dtype_og)
+
+        # Compute LSE for comparison
+        lse = scores.logsumexp(dim=-1)
+
+        return output, lse
+
     print("=" * 60)
-    print("FA4 sm100 (Blackwell) Benchmark - Local vs Pip Comparison")
+    print("FA4 sm100 (Blackwell) Benchmark - Local vs PyTorch Reference")
     print("=" * 60)
 
     # Check GPU
@@ -145,33 +183,15 @@ def run_fa4_benchmark(use_simple: bool = False):
     print(f"Mean time: {m_local.mean * 1e3:.3f} ms")
     print(f"TFLOPS: {tflops_local:.2f}")
 
-    # ===== Import Pip (Official) Version =====
+    # ===== Compute PyTorch Reference =====
     print("\n" + "=" * 60)
-    print("=== Pip (Official) FA4 ===")
+    print("=== PyTorch Reference ===")
     print("=" * 60)
 
-    # Remove local path temporarily to import pip version
-    sys.path.remove("/workspace/fa4")
-
-    from flash_attn.cute.interface import flash_attn_func as flash_attn_func_pip
-
-    # Warmup
-    for _ in range(5):
-        _ = flash_attn_func_pip(q, k, v, causal=causal)
+    # Use FP32 for reference to minimize numerical error
+    o_ref, lse_ref = attention_ref(q, k, v, causal=causal, upcast=True)
     torch.cuda.synchronize()
-
-    # Run pip version and collect output
-    o_pip, lse_pip = flash_attn_func_pip(q, k, v, causal=causal)
-    torch.cuda.synchronize()
-
-    # Benchmark timing
-    m_pip = time_fwd(flash_attn_func_pip, q, k, v, causal=causal, repeats=repeats)
-    tflops_pip = calc_tflops(
-        m_pip.mean, batch_size, nheads, seqlen_q, seqlen_k, head_dim, causal
-    )
-
-    print(f"Mean time: {m_pip.mean * 1e3:.3f} ms")
-    print(f"TFLOPS: {tflops_pip:.2f}")
+    print(f"Reference output computed (upcast to FP32)")
 
     # ===== Comparison =====
     print("\n" + "=" * 60)
@@ -188,21 +208,19 @@ def run_fa4_benchmark(use_simple: bool = False):
     else:
         print(f"Local LSE: None")
 
-    print(f"\nPip output sample values (first 5 elements):")
-    print(f"  {o_pip[0, 0, 0, :5].tolist()}")
-    print(f"Pip output shape: {o_pip.shape}, dtype: {o_pip.dtype}")
-    if lse_pip is not None:
-        print(f"Pip LSE sample values (first 5):")
-        print(f"  {lse_pip[0, 0, :5].tolist()}")
-    else:
-        print(f"Pip LSE: None")
+    print(f"\nReference output sample values (first 5 elements):")
+    print(f"  {o_ref[0, 0, 0, :5].tolist()}")
+    print(f"Reference output shape: {o_ref.shape}, dtype: {o_ref.dtype}")
+    if lse_ref is not None:
+        print(f"Reference LSE sample values (first 5):")
+        print(f"  {lse_ref[0, 0, :5].tolist()}")
 
-    # Compare outputs
-    diff = o_local - o_pip
+    # Compare outputs against reference
+    diff = o_local.float() - o_ref.float()
     abs_diff = torch.abs(diff)
-    rel_diff = abs_diff / (torch.abs(o_pip) + 1e-8)
+    rel_diff = abs_diff / (torch.abs(o_ref.float()) + 1e-8)
 
-    print(f"\nOutput difference stats:")
+    print(f"\nOutput difference stats (vs Reference):")
     print(f"  Max absolute diff: {abs_diff.max().item():.6e}")
     print(f"  Mean absolute diff: {abs_diff.mean().item():.6e}")
     print(f"  Max relative diff: {rel_diff.max().item():.6e}")
@@ -226,40 +244,83 @@ def run_fa4_benchmark(use_simple: bool = False):
     print(
         f"  Local value at max diff: {o_local[b_idx, h_idx, s_idx, d_idx].item():.6e}"
     )
-    print(f"  Pip value at max diff: {o_pip[b_idx, h_idx, s_idx, d_idx].item():.6e}")
+    print(
+        f"  Reference value at max diff: {o_ref[b_idx, h_idx, s_idx, d_idx].item():.6e}"
+    )
 
     # Check numerical closeness
     atol = 1e-2  # Absolute tolerance
     rtol = 1e-2  # Relative tolerance
-    is_close = torch.allclose(o_local, o_pip, atol=atol, rtol=rtol)
-    print(f"  All close (atol={atol}, rtol={rtol}): {is_close}")
+    is_close = torch.allclose(o_local.float(), o_ref.float(), atol=atol, rtol=rtol)
+    print(f"  All close vs reference (atol={atol}, rtol={rtol}): {is_close}")
 
     # Check for NaN/Inf
     print(f"  Local has NaN: {torch.isnan(o_local).any().item()}")
     print(f"  Local has Inf: {torch.isinf(o_local).any().item()}")
-    print(f"  Pip has NaN: {torch.isnan(o_pip).any().item()}")
-    print(f"  Pip has Inf: {torch.isinf(o_pip).any().item()}")
+    print(f"  Reference has NaN: {torch.isnan(o_ref).any().item()}")
+    print(f"  Reference has Inf: {torch.isinf(o_ref).any().item()}")
 
     # Compare LSE
-    if lse_local is not None and lse_pip is not None:
-        lse_diff = torch.abs(lse_local - lse_pip)
-        print(f"\nLSE difference stats:")
+    if lse_local is not None and lse_ref is not None:
+        lse_diff = torch.abs(lse_local.float() - lse_ref.float())
+        print(f"\nLSE difference stats (vs Reference):")
         print(f"  Max LSE diff: {lse_diff.max().item():.6e}")
         print(f"  Mean LSE diff: {lse_diff.mean().item():.6e}")
 
+    # ===== Optional: Compare with Pip Version =====
     print("\n" + "=" * 60)
-    print("=== Performance Comparison ===")
+    print("=== Optional: Pip FA4 Comparison ===")
     print("=" * 60)
-    print(f"Local (Mounted): {tflops_local:.2f} TFLOPS")
-    print(f"Pip (Official):  {tflops_pip:.2f} TFLOPS")
-    perf_diff = tflops_local - tflops_pip
-    perf_diff_pct = (perf_diff / tflops_pip) * 100 if tflops_pip != 0 else 0
-    print(f"Difference:      {perf_diff:+.2f} TFLOPS ({perf_diff_pct:+.2f}%)")
+
+    try:
+        # Remove local path temporarily to import pip version
+        sys.path.remove("/workspace/fa4")
+
+        from flash_attn.cute.interface import flash_attn_func as flash_attn_func_pip
+
+        # Warmup
+        for _ in range(5):
+            _ = flash_attn_func_pip(q, k, v, causal=causal)
+        torch.cuda.synchronize()
+
+        # Run pip version and collect output
+        o_pip, lse_pip = flash_attn_func_pip(q, k, v, causal=causal)
+        torch.cuda.synchronize()
+
+        # Benchmark timing
+        m_pip = time_fwd(flash_attn_func_pip, q, k, v, causal=causal, repeats=repeats)
+        tflops_pip = calc_tflops(
+            m_pip.mean, batch_size, nheads, seqlen_q, seqlen_k, head_dim, causal
+        )
+
+        print(f"Pip output sample values (first 5 elements):")
+        print(f"  {o_pip[0, 0, 0, :5].tolist()}")
+        print(f"Pip TFLOPS: {tflops_pip:.2f}")
+
+        # Compare pip vs reference
+        diff_pip = o_pip.float() - o_ref.float()
+        abs_diff_pip = torch.abs(diff_pip)
+        print(f"Pip vs Reference max diff: {abs_diff_pip.max().item():.6e}")
+
+        # Compare local vs pip
+        diff_local_pip = o_local.float() - o_pip.float()
+        abs_diff_local_pip = torch.abs(diff_local_pip)
+        print(f"Local vs Pip max diff: {abs_diff_local_pip.max().item():.6e}")
+
+        print("\n=== Performance Comparison ===")
+        print(f"Local (Mounted): {tflops_local:.2f} TFLOPS")
+        print(f"Pip (Official):  {tflops_pip:.2f} TFLOPS")
+        perf_diff = tflops_local - tflops_pip
+        perf_diff_pct = (perf_diff / tflops_pip) * 100 if tflops_pip != 0 else 0
+        print(f"Difference:      {perf_diff:+.2f} TFLOPS ({perf_diff_pct:+.2f}%)")
+
+    except Exception as e:
+        print(f"Pip comparison skipped: {e}")
 
     # Save results
     results_file = "/workspace/dump/fa4_benchmark_results.txt"
     with open(results_file, "w") as f:
-        f.write(f"FA4 sm100 Benchmark - Local vs Pip Comparison\n")
+        f.write(f"FA4 sm100 Benchmark - Local vs PyTorch Reference\n")
         f.write(f"=" * 50 + "\n")
         f.write(f"GPU: {torch.cuda.get_device_name(0)}\n")
         f.write(
@@ -268,30 +329,26 @@ def run_fa4_benchmark(use_simple: bool = False):
         f.write(f"\n")
         f.write(f"=== Performance ===\n")
         f.write(f"Local (Mounted): {tflops_local:.2f} TFLOPS\n")
-        f.write(f"Pip (Official):  {tflops_pip:.2f} TFLOPS\n")
-        f.write(f"Difference:      {perf_diff:+.2f} TFLOPS ({perf_diff_pct:+.2f}%)\n")
         f.write(f"\n")
         f.write(f"=== Output Sample Values ===\n")
         f.write(f"Local output[0,0,0,:5]: {o_local[0, 0, 0, :5].tolist()}\n")
-        f.write(f"Pip output[0,0,0,:5]:  {o_pip[0, 0, 0, :5].tolist()}\n")
+        f.write(f"Reference output[0,0,0,:5]:  {o_ref[0, 0, 0, :5].tolist()}\n")
         if lse_local is not None:
             f.write(f"Local LSE[0,0,:5]: {lse_local[0, 0, :5].tolist()}\n")
         else:
             f.write(f"Local LSE: None\n")
-        if lse_pip is not None:
-            f.write(f"Pip LSE[0,0,:5]:  {lse_pip[0, 0, :5].tolist()}\n")
-        else:
-            f.write(f"Pip LSE: None\n")
+        if lse_ref is not None:
+            f.write(f"Reference LSE[0,0,:5]:  {lse_ref[0, 0, :5].tolist()}\n")
         f.write(f"\n")
-        f.write(f"=== Output Difference ===\n")
+        f.write(f"=== Output Difference (vs Reference) ===\n")
         f.write(f"Max absolute diff: {abs_diff.max().item():.6e}\n")
         f.write(f"Mean absolute diff: {abs_diff.mean().item():.6e}\n")
         f.write(f"Max relative diff: {rel_diff.max().item():.6e}\n")
         f.write(f"All close (atol=1e-2, rtol=1e-2): {is_close}\n")
         f.write(f"Local has NaN: {torch.isnan(o_local).any().item()}\n")
         f.write(f"Local has Inf: {torch.isinf(o_local).any().item()}\n")
-        f.write(f"Pip has NaN: {torch.isnan(o_pip).any().item()}\n")
-        f.write(f"Pip has Inf: {torch.isinf(o_pip).any().item()}\n")
+        f.write(f"Reference has NaN: {torch.isnan(o_ref).any().item()}\n")
+        f.write(f"Reference has Inf: {torch.isinf(o_ref).any().item()}\n")
 
     print(f"\nResults saved to {results_file}")
 
@@ -307,5 +364,5 @@ def run_fa4_benchmark(use_simple: bool = False):
 
 
 @app.local_entrypoint()
-def main(use_simple: bool = True):
+def main(use_simple: bool = False):
     run_fa4_benchmark.remote(use_simple=use_simple)
