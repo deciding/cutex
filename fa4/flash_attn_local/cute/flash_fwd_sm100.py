@@ -1484,9 +1484,6 @@ class FlashAttentionForwardSm100:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, m_block, split_idx, num_splits
                 )
-                if tidx == 0 and bidx==2 and bidy==0 and bidz==0:
-                    cute.printf("n_block_min: {}\n", n_block_min)
-                    cute.printf("n_block_max: {}\n", n_block_max)
 
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
@@ -1959,6 +1956,7 @@ class FlashAttentionForwardSm100:
             * (len(self.softmax0_warp_ids))
         )
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+        bidx, bidy, bidz = cute.arch.block_idx()
 
         cta_qk_tiler = (
             self.mma_tiler_qk[0] // thr_mma_qk.thr_id.shape,
@@ -2358,6 +2356,13 @@ class FlashAttentionForwardSm100:
         5. Computing row sums for normalization
         6. Coordinating pipeline synchronization between different processing stages
         """
+        tidx = cute.arch.thread_idx()[0] % (
+            cute.arch.WARP_SIZE
+            # * (len(self.softmax0_warp_ids) if stage == 0 else len(self.softmax1_warp_ids)
+            * (len(self.softmax0_warp_ids))
+        )
+        bidx, bidy, bidz = cute.arch.block_idx()
+
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
@@ -2494,6 +2499,7 @@ class FlashAttentionForwardSm100:
             cute.arch.WARP_SIZE * len(self.correction_warp_ids)
         )
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+        bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = thr_mma_qk.thr_idx
 
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
@@ -2606,7 +2612,6 @@ class FlashAttentionForwardSm100:
                         scale = sScale[tidx + stage * self.m_block_size]
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                         # should_rescale = True
-                        # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
                         # Don't need O_full anymore, since by the time softmax has signaled the correction
                         # warps, S_i must have been done, so O_i-1 must have been done as well.
                         # pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)

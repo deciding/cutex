@@ -59,7 +59,7 @@ class FlashAttentionForwardSm100Simple:
         n_block_size: int = 128,
         q_stage: int = 2,
         is_persistent: bool = True,
-        use_2cta_instrs: bool = False,  # Disabled for debugging
+        use_2cta_instrs: bool = True,  # Disabled for debugging
     ):
         hdim_multiple_of = 16
         self.head_dim_padded = int(
@@ -1421,19 +1421,11 @@ class FlashAttentionForwardSm100Simple:
                     mma_si_consumer_phase,
                     sm_stats_producer_phase,
                     n_block,
-                    mask_fn=partial(mask_fn, mask_seqlen=False),
                 )
             # Separate iterations with local masking on the left
 
             # Dense path always writes scale / signals
             sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
-            if tidx == 0 and bidx == 0:
-                cute.printf(
-                    "[SOFTMAX stage=%d] row_sum=%f row_max=%f\n",
-                    stage,
-                    softmax.row_sum[0],
-                    softmax.row_max[0],
-                )
             if const_expr(mLSE is not None):
                 sScale[
                     tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
@@ -1468,6 +1460,13 @@ class FlashAttentionForwardSm100Simple:
         is_first: bool = False,
         mask_fn: Optional[Callable] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
+
+        tidx = cute.arch.thread_idx()[0] % (
+            cute.arch.WARP_SIZE
+            # * (len(self.softmax0_warp_ids) if stage == 0 else len(self.softmax1_warp_ids)
+            * (len(self.softmax0_warp_ids))
+        )
+        bidx, bidy, bidz = cute.arch.block_idx()
 
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
@@ -1657,13 +1656,6 @@ class FlashAttentionForwardSm100Simple:
                     )
                     scale = sScale[tidx + stage * self.m_block_size]
                     should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
-                    if tidx == 0 and bidx == 0 and stage == 0:
-                        cute.printf(
-                            "[CORRECTION] stage=%d scale=%f should_rescale=%d\n",
-                            stage,
-                            scale,
-                            should_rescale,
-                        )
                     # should_rescale = True
                     if should_rescale:
                         self.correction_rescale(
