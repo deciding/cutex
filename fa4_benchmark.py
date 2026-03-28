@@ -141,8 +141,8 @@ def run_fa4_benchmark(use_simple: bool = False):
 
     batch_size = 1
     nheads = 1
-    seqlen_q = 256
-    seqlen_k = 256
+    seqlen_q = 8192
+    seqlen_k = 8192
 
     print(
         f"\nConfig: batch={batch_size}, heads={nheads}, seq_len={seqlen_q}, head_dim={head_dim}, causal={causal}"
@@ -248,11 +248,100 @@ def run_fa4_benchmark(use_simple: bool = False):
         f"  Reference value at max diff: {o_ref[b_idx, h_idx, s_idx, d_idx].item():.6e}"
     )
 
+    # ===== Position-Based Error Analysis =====
+    print(
+        f"\n=== Position-Based Error Analysis ==="
+    )  # Analyze error distribution across sequence positions
+    # Shape: (batch, seq_q, nheads, head_dim)
+    seq_len = o_local.shape[1]
+    if seq_len >= 4:
+        # Split sequence into quadrants
+        mid_seq = seq_len // 2
+        mid_dim = o_local.shape[3] // 2
+
+        # Top-left quadrant (early sequence, early dims)
+        top_left = abs_diff[:, :mid_seq, :, :mid_dim]
+        # Top-right quadrant (early sequence, late dims)
+        top_right = abs_diff[:, :mid_seq, :, mid_dim:]
+        # Bottom-left quadrant (late sequence, early dims)
+        bottom_left = abs_diff[:, mid_seq:, :, :mid_dim]
+        # Bottom-right quadrant (late sequence, late dims)
+        bottom_right = abs_diff[:, mid_seq:, :, mid_dim:]
+
+        print(f"\n  Quadrant Analysis (sequence x head_dim):")
+        print(
+            f"    Top-Left    (seq 0-{mid_seq - 1}, dim0-{mid_dim - 1}): mean={top_left.mean().item():.6e}, max={top_left.max().item():.6e}"
+        )
+        print(
+            f"    Top-Right   (seq 0-{mid_seq - 1}, dim{mid_dim}-{o_local.shape[3] - 1}): mean={top_right.mean().item():.6e}, max={top_right.max().item():.6e}"
+        )
+        print(
+            f"    Bottom-Left (seq {mid_seq}-{seq_len - 1}, dim 0-{mid_dim - 1}): mean={bottom_left.mean().item():.6e}, max={bottom_left.max().item():.6e}"
+        )
+        print(
+            f"    Bottom-Right (seq {mid_seq}-{seq_len - 1}, dim {mid_dim}-{o_local.shape[3] - 1}): mean={bottom_right.mean().item():.6e}, max={bottom_right.max().item():.6e}"
+        )
+
+        # Per-sequence-position error (average over batch, heads, dims)
+        seq_errors = abs_diff.mean(dim=(0, 2, 3))  # shape: (seq_len,)
+        print(f"\n  Sequence Position Error Profile:")
+        print(f"    First 5 positions: {seq_errors[:5].tolist()}")
+        print(f"    Last 5 positions: {seq_errors[-5:].tolist()}")
+        print(f"    First half avg: {seq_errors[:mid_seq].mean().item():.6e}")
+        print(f"    Second half avg: {seq_errors[mid_seq:].mean().item():.6e}")
+
+        # Per-head-dimension error (average over batch, seq, heads)
+        dim_errors = abs_diff.mean(dim=(0, 1, 2))  # shape: (head_dim,)
+        print(f"\n  Head Dimension Error Profile:")
+        print(f"    First 8 dims: {dim_errors[:8].tolist()}")
+        print(f"    Last 8 dims: {dim_errors[-8:].tolist()}")
+        print(f"    First half avg: {dim_errors[:mid_dim].mean().item():.6e}")
+        print(f"    Second half avg: {dim_errors[mid_dim:].mean().item():.6e}")
+
+    # ===== Percentage Not Close Analysis =====
+    print(f"\n=== Percentage Not Close Analysis ===")
+    tolerance_levels = [1e-3, 5e-3, 1e-2, 5e-2, 1e-1]
+    total_elements = abs_diff.numel()
+
+    print(f"  Total elements: {total_elements:,}")
+    for tol in tolerance_levels:
+        not_close = (abs_diff > tol).sum().item()
+        pct_not_close = 100.0 * not_close / total_elements
+        print(
+            f"    > {tol:.0e}: {not_close:,} elements ({pct_not_close:.2f}% not close)"
+        )
+
+    # Histogram of errors
+    print(f"\n  Error Histogram (absolute difference):")
+    hist_bins = [0, 1e-4, 1e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1.0, float("inf")]
+    hist_labels = [
+        "[0, 1e-4)",
+        "[1e-4, 1e-3)",
+        "[1e-3, 1e-2)",
+        "[1e-2, 5e-2)",
+        "[5e-2, 1e-1)",
+        "[1e-1, 5e-1)",
+        "[5e-1, 1.0)",
+        "[1.0, inf)",
+    ]
+    for i in range(len(hist_bins) - 1):
+        if i == len(hist_bins) - 2:
+            count = (abs_diff >= hist_bins[i]).sum().item()
+        else:
+            count = (
+                ((abs_diff >= hist_bins[i]) & (abs_diff < hist_bins[i + 1]))
+                .sum()
+                .item()
+            )
+        pct = 100.0 * count / total_elements
+        bar = "=" * int(pct / 2)
+        print(f"    {hist_labels[i]}: {count:,} ({pct:.1f}%) {bar}")
+
     # Check numerical closeness
     atol = 1e-2  # Absolute tolerance
     rtol = 1e-2  # Relative tolerance
     is_close = torch.allclose(o_local.float(), o_ref.float(), atol=atol, rtol=rtol)
-    print(f"  All close vs reference (atol={atol}, rtol={rtol}): {is_close}")
+    print(f"\n  All close vs reference (atol={atol}, rtol={rtol}): {is_close}")
 
     # Check for NaN/Inf
     print(f"  Local has NaN: {torch.isnan(o_local).any().item()}")
@@ -344,11 +433,38 @@ def run_fa4_benchmark(use_simple: bool = False):
         f.write(f"Max absolute diff: {abs_diff.max().item():.6e}\n")
         f.write(f"Mean absolute diff: {abs_diff.mean().item():.6e}\n")
         f.write(f"Max relative diff: {rel_diff.max().item():.6e}\n")
-        f.write(f"All close (atol=1e-2, rtol=1e-2): {is_close}\n")
+        f.write(f"All close (atol={atol}, rtol={rtol}): {is_close}\n")
         f.write(f"Local has NaN: {torch.isnan(o_local).any().item()}\n")
         f.write(f"Local has Inf: {torch.isinf(o_local).any().item()}\n")
         f.write(f"Reference has NaN: {torch.isnan(o_ref).any().item()}\n")
         f.write(f"Reference has Inf: {torch.isinf(o_ref).any().item()}\n")
+        f.write(f"\n")
+        f.write(f"=== Percentage Not Close ===\n")
+        for tol in tolerance_levels:
+            not_close = (abs_diff > tol).sum().item()
+            pct_not_close = 100.0 * not_close / total_elements
+            f.write(
+                f"  > {tol:.0e}: {not_close:,} elements ({pct_not_close:.2f}% not close)\n"
+            )
+        f.write(f"\n")
+        if seq_len >= 4:
+            f.write(f"=== Position-Based Error ===\n")
+            f.write(f"Top-Left quadrant mean: {top_left.mean().item():.6e}\n")
+            f.write(f"Top-Right quadrant mean: {top_right.mean().item():.6e}\n")
+            f.write(f"Bottom-Left quadrant mean: {bottom_left.mean().item():.6e}\n")
+            f.write(f"Bottom-Right quadrant mean: {bottom_right.mean().item():.6e}\n")
+            f.write(
+                f"First half sequence avg: {seq_errors[:mid_seq].mean().item():.6e}\n"
+            )
+            f.write(
+                f"Second half sequence avg: {seq_errors[mid_seq:].mean().item():.6e}\n"
+            )
+            f.write(
+                f"First half head_dim avg: {dim_errors[:mid_dim].mean().item():.6e}\n"
+            )
+            f.write(
+                f"Second half head_dim avg: {dim_errors[mid_dim:].mean().item():.6e}\n"
+            )
 
     print(f"\nResults saved to {results_file}")
 
@@ -364,5 +480,5 @@ def run_fa4_benchmark(use_simple: bool = False):
 
 
 @app.local_entrypoint()
-def main(use_simple: bool = False):
+def main(use_simple: bool = True):
     run_fa4_benchmark.remote(use_simple=use_simple)
