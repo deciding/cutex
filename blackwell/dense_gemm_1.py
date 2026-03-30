@@ -238,7 +238,7 @@ def kernel(
             sB[(None, None), None, None, None], 0, 4
         ),  # smem_tensor: SMEM tensor grouped for B
         cute.group_modes(
-            tCgB[(None, None), None, None, None], 0, 4
+            tCgB[(None, None), None, None, None, None], 0, 4
         ),  # gmem_tensor: GMEM tensor grouped for B
     )
 
@@ -262,7 +262,7 @@ def kernel(
     # epi_tiler: (epi_tile_m, epi_tile_n)
     # tEPItAcc: (epi_tile_m, epi_tile_n, mma_rest_m, mma_rest_n, tma_rest_m, tma_rest_n)
     tEPItAcc = cute.flat_divide(tCtAcc[(None, None), None, None], epi_tiler)
-    tEPIgC = cute.flat_divide(tCgC[(None, None), None, None], epi_tiler)
+    tEPIgC = cute.flat_divide(tCgC[(None, None), None, None, None, None], epi_tiler)
     # tEPIgC: (epi_tile_m, epi_tile_n, mma_rest_m, mma_rest_n, tma_rest_m, tma_rest_n, RestM, RestN)
 
     # TMEM copy atom: loads 32x32 blocks with x64 repetition (64 elements per instruction)
@@ -299,8 +299,6 @@ def kernel(
     tCrC = cute.make_rmem_tensor(
         tTRgC[None, None, None, 0, 0, 0, 0, 0, 0].shape, io_dtype
     )
-    # grouped shape: (tmem_atom, epi_tile_m, epi_tile_n, (mma_rest_m, mma_rest_n, tma_rest_m, tma_rest_n, RestM, RestN)) = (tmem_atom, epi_tile_m, epi_tile_n, other_rests)
-    tTRgC = cute.group_modes(tTRgC, 3, cute.rank(tTRgC))
 
     #
     # 2. Main loop
@@ -318,13 +316,13 @@ def kernel(
             # TMA loads
             cute.copy(
                 tma_atom_a,
-                tAgA[(None, k_tile_idx)],  # Notation: tma_atom
+                tAgA[(None, mma_coord_mnk[0], k_tile_idx)],  # Notation: tma_atom
                 tAsA[(None, 0)],  # Notation: tma_atom, stage = 1
                 tma_bar_ptr=ab_mbar_full,
             )
             cute.copy(
                 tma_atom_b,
-                tBgB[(None, k_tile_idx)],
+                tBgB[(None, mma_coord_mnk[1], k_tile_idx)],
                 tBsB[(None, 0)],
                 tma_bar_ptr=ab_mbar_full,
             )
@@ -385,12 +383,16 @@ def kernel(
     #   1. Copy from TMEM (tTRtC) to register (tCrAcc) - Float32
     #   2. Convert to output dtype and store to register (tCrC) - Float16
     #   3. Copy from register (tCrC) to global memory (tTRgC) - Float16
+
+    # grouped shape: (tmem_atom, epi_tile_m, epi_tile_n, (mma_rest_m, mma_rest_n, tma_rest_m, tma_rest_n, RestM, RestN)) = (tmem_atom, epi_tile_m, epi_tile_n, other_rests)
+    tTRgC_tile = tTRgC[None, None, None, None, None, None, None, mma_coord_mnk[0], mma_coord_mnk[1]]
+    tTRgC_tile = cute.group_modes(tTRgC_tile, 3, cute.rank(tTRgC_tile))
     for i in cutlass.range(cute.size(tTRtC, mode=[3])):  # mma_rest_m * mma_rest_n tiles
         cute.copy(
             tmem_tiled_copy, tTRtC[None, None, None, i], tCrAcc
         )  # TMEM -> Reg (Float32)
         tCrC.store(tCrAcc.load().to(io_dtype))  # Convert to Float16
-        cute.autovec_copy(tCrC, tTRgC[None, None, None, i])  # Reg -> Global (Float16)
+        cute.autovec_copy(tCrC, tTRgC_tile[None, None, None, i])  # Reg -> Global (Float16)
 
     # Deallocate TMEM
     pipeline.sync(barrier_id=1)
