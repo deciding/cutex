@@ -139,11 +139,6 @@ def run_fa4_benchmark(use_simple: bool = False):
     causal = False
     repeats = 30
 
-    batch_size = 1
-    nheads = 1
-    seqlen_q = 8192
-    seqlen_k = 8192
-
     print(
         f"\nConfig: batch={batch_size}, heads={nheads}, seq_len={seqlen_q}, head_dim={head_dim}, causal={causal}"
     )

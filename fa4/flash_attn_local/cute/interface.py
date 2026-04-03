@@ -50,19 +50,28 @@ from flash_attn.cute.cute_dsl_utils import (
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
 from .flash_fwd_sm100 import FlashAttentionForwardSm100
-from .flash_fwd_sm100_simple import FlashAttentionForwardSm100Simple as Fa100Simple
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 
 # Router to switch between original and simple implementations
 # Set USE_SIMPLE_FA4=1 in environment to use simple version
+# Set USE_SIMPLE_FA4_VERSION to select which simplified version (1, 2, etc.)
 import os
 
 _USE_SIMPLE = os.environ.get("USE_SIMPLE_FA4", "0") == "1"
+_USE_SIMPLE_VERSION = int(os.environ.get("USE_SIMPLE_FA4_VERSION", "1"))
+
+# Direct imports for each simple version
+from .flash_fwd_sm100_simple import FlashAttentionForwardSm100Simple
+
+
+def _get_fa100_simple_class():
+    version = _USE_SIMPLE_VERSION
+    return FlashAttentionForwardSm100Simple
 
 
 def _get_fa100_class():
     """Get the appropriate FlashAttentionForwardSm100 class based on environment variable."""
-    return Fa100Simple if _USE_SIMPLE else FlashAttentionForwardSm100
+    return _get_fa100_simple_class() if _USE_SIMPLE else FlashAttentionForwardSm100
 
 
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
@@ -483,6 +492,10 @@ def _flash_attn_fwd(
         page_size not in [None, 128],  # paged KV non-TMA
         q_subtile_factor,
     )
+    Fa100Simple_cls = _get_fa100_class() if _USE_SIMPLE else None
+    simple18_no_q_varlen = (
+        Fa100Simple_cls is FlashAttentionForwardSm100Simple and arch // 10 in [10, 11]
+    )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
             cu_seqlens_q_tensor,
@@ -562,7 +575,7 @@ def _flash_attn_fwd(
             )
             if _USE_SIMPLE:
                 # Simple version - only supports basic config
-                fa_fwd = Fa100Simple(
+                fa_fwd = Fa100Simple_cls(
                     head_dim=head_dim,
                     head_dim_v=head_dim_v,
                 )
@@ -596,7 +609,7 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {arch}. Supported: 9.x, 10.x, 11.x"
             )
         # TODO: check @can_implement
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+        compile_args = [
             fa_fwd,
             q_tensor,
             k_tensor,
@@ -605,17 +618,32 @@ def _flash_attn_fwd(
             lse_tensor,
             softmax_scale,
             current_stream,
-            cu_seqlens_q_tensor,
-            cu_seqlens_k_tensor,
-            seqused_q_tensor,
-            seqused_k_tensor,
-            page_table_tensor,
-            window_size_left,
-            window_size_right,
-            learnable_sink_tensor,
-            sparse_tensors,
-            cute_aux_tensors,
-            options="--enable-tvm-ffi --opt-level 3",
+        ]
+        if simple18_no_q_varlen:
+            compile_args.extend(
+                [
+                    window_size_left,
+                    window_size_right,
+                    learnable_sink_tensor,
+                ]
+            )
+        else:
+            compile_args.extend(
+                [
+                    cu_seqlens_q_tensor,
+                    cu_seqlens_k_tensor,
+                    seqused_q_tensor,
+                    seqused_k_tensor,
+                    page_table_tensor,
+                    window_size_left,
+                    window_size_right,
+                    learnable_sink_tensor,
+                    sparse_tensors,
+                    cute_aux_tensors,
+                ]
+            )
+        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            *compile_args, options="--enable-tvm-ffi --opt-level 3"
         )
 
     # In "fake mode", we will take torch fake tensors as input and the expected behaviors are:
@@ -623,7 +651,7 @@ def _flash_attn_fwd(
     # - Return "fake" output tensors, which could be needed in follow-up fake operations
     # Thus, we skip the actual kernel invocation here.
     if not is_fake_mode():
-        _flash_attn_fwd.compile_cache[compile_key](
+        runtime_args = [
             q.detach(),
             k.detach(),
             v.detach(),
@@ -631,19 +659,33 @@ def _flash_attn_fwd(
             lse_partial if is_split_kv else lse,
             softmax_scale,
             current_stream,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            page_table,
-            window_size_left,
-            window_size_right,
-            learnable_sink,
-            normalized_block_sparse_tensors[:4]
-            if normalized_block_sparse_tensors is not None
-            else None,
-            aux_tensors,
-        )
+        ]
+        if simple18_no_q_varlen:
+            runtime_args.extend(
+                [
+                    window_size_left,
+                    window_size_right,
+                    learnable_sink,
+                ]
+            )
+        else:
+            runtime_args.extend(
+                [
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_q,
+                    seqused_k,
+                    page_table,
+                    window_size_left,
+                    window_size_right,
+                    learnable_sink,
+                    normalized_block_sparse_tensors[:4]
+                    if normalized_block_sparse_tensors is not None
+                    else None,
+                    aux_tensors,
+                ]
+            )
+        _flash_attn_fwd.compile_cache[compile_key](*runtime_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
