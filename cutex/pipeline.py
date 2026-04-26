@@ -1,4 +1,7 @@
-from cutlass.pipeline import pipeline_init_arrive
-from cutlass.pipeline import pipeline_init_wait
+import cutlass.pipeline as _pipeline
 
-__all__ = ["pipeline_init_arrive", "pipeline_init_wait"]
+for _name in getattr(_pipeline, "__all__", ()):
+    if hasattr(_pipeline, _name):
+        globals()[_name] = getattr(_pipeline, _name)
+
+__all__ = [name for name in getattr(_pipeline, "__all__", ()) if hasattr(_pipeline, name)]
