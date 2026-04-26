@@ -4,23 +4,30 @@ Tests torch.matmul and dense_gemm with same settings.
 """
 
 # Which tests to run - modify this list to choose which tests to execute
-# Available options: "torch", "dense_gemm", "dense_gemm_1", "dense_gemm_2", "dense_gemm_3", "dense_gemm_4", "dense_gemm_5", "dense_gemm_6", "dense_gemm_7"
+# Available options: "torch", "dense_gemm", "dense_gemm_1", "dense_gemm_2", "dense_gemm_3", "dense_gemm_4", "dense_gemm_5", "dense_gemm_6", "dense_gemm_7", "dense_gemm_7min"
 RUN_TESTS = [
     # "torch",
     # "dense_gemm",
-    "dense_gemm_1",
+    # "dense_gemm_1",
     # "dense_gemm_2",
     # "dense_gemm_3",
     # "dense_gemm_4",
     # "dense_gemm_5",
     # "dense_gemm_6",
     # "dense_gemm_7",
+    "dense_gemm_7min",
     # "persistent",
     # "prefetch",
     # "software_pipeline",
     # "2sm",
     # "cute_pipeline",
 ]
+
+# Input initialization mode for benchmark tensors.
+# Options: "randint" or "gaussian"
+INIT_MODE = "randint"
+NORMAL_MEAN = 0.0
+NORMAL_STD = 1.0
 
 
 from datetime import datetime
@@ -97,6 +104,9 @@ def run_dense_gemm():
     print(f"\n=== Benchmark: {M}x{N}x{K} ===")
     print(f"Warmup: {warmup}, Iterations: {repeats}")
     print(f"RUN_TESTS: {RUN_TESTS}")
+    print(f"INIT_MODE: {INIT_MODE}")
+    if INIT_MODE == "gaussian":
+        print(f"NORMAL_MEAN/NORMAL_STD: {NORMAL_MEAN}/{NORMAL_STD}")
 
     import torch.utils.benchmark as benchmark
 
@@ -106,8 +116,22 @@ def run_dense_gemm():
     if "torch" in RUN_TESTS:
         print("\n=== 1. torch.matmul Benchmark ===")
         torch.manual_seed(1111)
-        a = torch.empty(M, K, dtype=torch.float16).random_(-2, 2).to("cuda")
-        b = torch.empty(N, K, dtype=torch.float16).random_(-2, 2).to("cuda")
+        if INIT_MODE == "randint":
+            a = torch.empty(M, K, dtype=torch.float16).random_(-2, 3).to("cuda")
+            b = torch.empty(N, K, dtype=torch.float16).random_(-2, 3).to("cuda")
+        elif INIT_MODE == "gaussian":
+            a = (
+                torch.empty(M, K, dtype=torch.float16)
+                .normal_(NORMAL_MEAN, NORMAL_STD)
+                .to("cuda")
+            )
+            b = (
+                torch.empty(N, K, dtype=torch.float16)
+                .normal_(NORMAL_MEAN, NORMAL_STD)
+                .to("cuda")
+            )
+        else:
+            raise ValueError(f"Unsupported INIT_MODE: {INIT_MODE}")
 
         timer = benchmark.Timer(
             stmt="torch.matmul(a, b.T)",
@@ -149,6 +173,12 @@ def run_dense_gemm():
                     "--iterations",
                     str(repeats),
                     "--skip_ref_check",
+                    "--init_mode",
+                    INIT_MODE,
+                    "--normal_mean",
+                    str(NORMAL_MEAN),
+                    "--normal_std",
+                    str(NORMAL_STD),
                 ],
                 capture_output=True,
                 text=True,
@@ -177,6 +207,9 @@ def run_dense_gemm():
                 iterations=repeats,
                 skip_ref_check=False,
                 use_cold_l2=False,
+                init_mode=INIT_MODE,
+                normal_mean=NORMAL_MEAN,
+                normal_std=NORMAL_STD,
             )
             time_ms = us / 1000
             tflops = flops / time_ms / 1e9
@@ -193,6 +226,9 @@ def run_dense_gemm():
             warmup_iterations=warmup,
             iterations=repeats,
             skip_ref_check=False,
+            init_mode=INIT_MODE,
+            normal_mean=NORMAL_MEAN,
+            normal_std=NORMAL_STD,
         )
         time_ms = us / 1000
         tflops1 = flops / time_ms / 1e9
@@ -209,6 +245,9 @@ def run_dense_gemm():
             warmup_iterations=warmup,
             iterations=repeats,
             skip_ref_check=False,
+            init_mode=INIT_MODE,
+            normal_mean=NORMAL_MEAN,
+            normal_std=NORMAL_STD,
         )
         time_ms = us / 1000
         tflops2 = flops / time_ms / 1e9
@@ -225,6 +264,9 @@ def run_dense_gemm():
             warmup_iterations=warmup,
             iterations=repeats,
             skip_ref_check=False,
+            init_mode=INIT_MODE,
+            normal_mean=NORMAL_MEAN,
+            normal_std=NORMAL_STD,
         )
         time_ms = us / 1000
         tflops3 = flops / time_ms / 1e9
@@ -241,6 +283,9 @@ def run_dense_gemm():
             warmup_iterations=warmup,
             iterations=repeats,
             skip_ref_check=False,
+            init_mode=INIT_MODE,
+            normal_mean=NORMAL_MEAN,
+            normal_std=NORMAL_STD,
         )
         time_ms = us / 1000
         tflops4 = flops / time_ms / 1e9
@@ -257,6 +302,9 @@ def run_dense_gemm():
             warmup_iterations=warmup,
             iterations=repeats,
             skip_ref_check=False,
+            init_mode=INIT_MODE,
+            normal_mean=NORMAL_MEAN,
+            normal_std=NORMAL_STD,
         )
         time_ms = us / 1000
         tflops5 = flops / time_ms / 1e9
@@ -428,6 +476,9 @@ def run_dense_gemm():
             warmup_iterations=warmup,
             iterations=repeats,
             skip_ref_check=False,
+            init_mode=INIT_MODE,
+            normal_mean=NORMAL_MEAN,
+            normal_std=NORMAL_STD,
         )
         time_ms = us / 1000
         tflops6 = flops / time_ms / 1e9
@@ -444,10 +495,34 @@ def run_dense_gemm():
             warmup_iterations=warmup,
             iterations=repeats,
             skip_ref_check=False,
+            init_mode=INIT_MODE,
+            normal_mean=NORMAL_MEAN,
+            normal_std=NORMAL_STD,
         )
         time_ms = us / 1000
         tflops7 = flops / time_ms / 1e9
         print(f"dense_gemm_7: {time_ms:.4f} ms, {tflops7:.2f} TFLOPS")
+
+    # 15. dense_gemm_7min.py
+    if "dense_gemm_7min" in RUN_TESTS:
+        print("\n=== 15. dense_gemm_7min.py Benchmark ===")
+        from cuteDSL.blackwell.dense_gemm_7min import (
+            run_dense_gemm as run_dense_gemm_7min,
+        )
+
+        us = run_dense_gemm_7min(
+            (M, N, K),
+            tolerance=0.1,
+            warmup_iterations=warmup,
+            iterations=repeats,
+            skip_ref_check=False,
+            init_mode=INIT_MODE,
+            normal_mean=NORMAL_MEAN,
+            normal_std=NORMAL_STD,
+        )
+        time_ms = us / 1000
+        tflops7min = flops / time_ms / 1e9
+        print(f"dense_gemm_7min: {time_ms:.4f} ms, {tflops7min:.2f} TFLOPS")
 
     print(f"\nDone! Results saved to: {DUMP_DIR}")
 

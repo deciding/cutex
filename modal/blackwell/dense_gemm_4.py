@@ -68,7 +68,7 @@ mma_tiler_mnk = (
 threads_per_cta = 128
 
 # Pipeline stage configuration
-ab_stages = 7 # TODO: don't hardcode this
+ab_stages = 7  # TODO: don't hardcode this
 acc_stage = 1
 
 # Cluster configuration (Step 1: Add cluster support)
@@ -103,7 +103,7 @@ def kernel(
     # [PAIR-UMMA] Parameters for TMEM load
     cta_tile_shape_mnk: cutlass.Constexpr,
     c_layout: cutlass.Constexpr,
-    use_2cta_instrs: cutlass.Constexpr
+    use_2cta_instrs: cutlass.Constexpr,
 ):
     # Current thread/warp/block coordinates
     tidx, _, _ = cute.arch.thread_idx()
@@ -200,9 +200,9 @@ def kernel(
 
     # [CLUSTER] Initialize pipeline if you used defer_sync
     ## mbarrier_init_fence, cluster_arrive
-    #pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
+    # pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
     ## cluster_wait
-    #pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+    # pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
     # Partition tensors for MMA and make fragments
     # (bM, bK, RestK)
@@ -228,7 +228,7 @@ def kernel(
     # (MMA, MMA_M, MMA_N)
     tCtAcc = tiled_mma.make_fragment_C(acc_shape)
 
-    num_tmem_cols = utils.get_num_tmem_alloc_cols(tCtAcc) # no hard code
+    num_tmem_cols = utils.get_num_tmem_alloc_cols(tCtAcc)  # no hard code
     tmem.allocate(num_tmem_cols)
 
     # Partition tensors for TMA; This requires the tensors partitioned for MMA
@@ -261,14 +261,14 @@ def kernel(
     # Swap the pointer in tCtAcc
     tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc.layout)
 
-    #subtile_cnt = 4
+    # subtile_cnt = 4
     # (EpiTile)
     epi_tiler = cta_tile_shape_mnk[:2]
     # (EpiTile, NumTiles)
-    #tCtAcc_epi = cute.zipped_divide(tCtAcc, epi_tiler)
+    # tCtAcc_epi = cute.zipped_divide(tCtAcc, epi_tiler)
     tCtAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tiler)
     # (EpiTile, NumTiles)
-    #gC_epi = cute.zipped_divide(tCgC, epi_tiler)
+    # gC_epi = cute.zipped_divide(tCgC, epi_tiler)
     gC_epi = cute.flat_divide(tCgC[((None, None), 0, 0)], epi_tiler)
 
     # [PAIR-UMMA] Use sm100_utils for TMEM load with pair-UMMA support
@@ -280,8 +280,10 @@ def kernel(
         epi_tiler,
         use_2cta_instrs,
     )
-    #tmem_tiled_copy = tcgen05.make_tmem_copy(tmem_copy_atom, tCtAcc_epi[None, 0])
-    tmem_tiled_copy = tcgen05.make_tmem_copy(tmem_copy_atom, tCtAcc_epi[None, None, 0, 0])
+    # tmem_tiled_copy = tcgen05.make_tmem_copy(tmem_copy_atom, tCtAcc_epi[None, 0])
+    tmem_tiled_copy = tcgen05.make_tmem_copy(
+        tmem_copy_atom, tCtAcc_epi[None, None, 0, 0]
+    )
     tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
 
     # (TmemCpy,NumTmemCpy,NumTiles)
@@ -380,7 +382,7 @@ def kernel(
         tCrC.store(tCrAcc.load().to(io_dtype))
         cute.copy(simt_atom, tCrC, tDgC[(None, None, None, i)])
         # This will store v4 to smem then load v4 and store to gmem
-        #cute.autovec_copy(tCrC, tDgC[None, None, None, i])
+        # cute.autovec_copy(tCrC, tDgC[None, None, None, i])
 
     acc_full.release()
 
@@ -492,7 +494,7 @@ def host_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, stream):
     grid_shape = cute.round_up(
         cute.ceil_div(
             (*c.layout.shape, 1),
-            (mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id.shape), mma_tiler_mnk[1])
+            (mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id.shape), mma_tiler_mnk[1]),
         ),
         cluster_shape_mnl,
     )
@@ -514,7 +516,7 @@ def host_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, stream):
         num_tma_producer,
         cta_tile_shape_mnk,
         c_layout,
-        use_2cta_instrs
+        use_2cta_instrs,
     ).launch(
         grid=grid_shape,
         block=(threads_per_cta, 1, 1),
@@ -529,6 +531,9 @@ def run_dense_gemm(
     warmup_iterations=10,
     iterations=100,
     skip_ref_check=False,
+    init_mode: str = "randint",
+    normal_mean: float = 0.0,
+    normal_std: float = 1.0,
 ):
     global torch, cutlass_torch
     import torch
@@ -538,6 +543,9 @@ def run_dense_gemm(
     print("Running Blackwell fp16 GEMM example 2 with:")
     print(f"  mnk:       {mnk}")
     print(f"  tolerance: {tolerance}")
+    print(f"  init_mode: {init_mode}")
+    if init_mode == "gaussian":
+        print(f"  normal_mean/std: {normal_mean}/{normal_std}")
     print("===================================================================")
     print()
 
@@ -553,11 +561,14 @@ def run_dense_gemm(
     ## Make K-major tensors (torch tensors are row-major)
     def make_tensors(mn, k, dtype):
         shape = (mn, k)
-        return (
-            torch.empty(*shape, dtype=torch.int32)
-            .random_(-2, 2)
-            .to(dtype=dtype, device="cuda")
-        )
+        t = torch.empty(*shape, dtype=torch.float32)
+        if init_mode == "randint":
+            t.random_(-2, 3)
+        elif init_mode == "gaussian":
+            t.normal_(mean=normal_mean, std=normal_std)
+        else:
+            raise ValueError(f"Unsupported init_mode: {init_mode}")
+        return t.to(dtype=dtype, device="cuda")
 
     # a = make_tensors(m, k, cutlass_torch.dtype(io_dtype))
     # b = make_tensors(n, k, cutlass_torch.dtype(io_dtype))
@@ -656,8 +667,8 @@ def run_dense_gemm(
         # Compute reference result
         ref = torch.einsum(
             "mk,nk->mn",
-            a_torch_cpu.to(dtype=torch.float32),
-            b_torch_cpu.to(dtype=torch.float32),
+            a_torch_cpu.to(dtype=torch.float16),
+            b_torch_cpu.to(dtype=torch.float16),
         )
 
         # Convert ref to c_dtype
@@ -715,6 +726,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
     )
+    parser.add_argument(
+        "--init_mode",
+        choices=["randint", "gaussian"],
+        default="randint",
+        help="Input initialization mode",
+    )
+    parser.add_argument(
+        "--normal_mean",
+        type=float,
+        default=0.0,
+        help="Gaussian mean when --init_mode gaussian",
+    )
+    parser.add_argument(
+        "--normal_std",
+        type=float,
+        default=1.0,
+        help="Gaussian std when --init_mode gaussian",
+    )
     args = parser.parse_args()
     if len(args.mnk) != 3:
         parser.error("--mnk must contain exactly 3 values")
@@ -724,5 +753,8 @@ if __name__ == "__main__":
     run_dense_gemm(
         args.mnk,
         args.tolerance,
+        init_mode=args.init_mode,
+        normal_mean=args.normal_mean,
+        normal_std=args.normal_std,
     )
     print("PASS")

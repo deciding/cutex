@@ -308,18 +308,14 @@ def kernel(
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
         # [TMEM_STORE] tmem copy dst: tTR_rAcc
         # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
-        tCgC_epi = cute.flat_divide(
-            tCgC[((None, None), 0, 0)], epi_tiler
-        )
+        tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0)], epi_tiler)
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
         tTR_gC = tmem_thr_copy.partition_D(tCgC_epi)
         # (T2R, T2R_M, T2R_N)
         tTR_rAcc = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0)].shape, acc_dtype
         )
-        tTR_rC = cute.make_rmem_tensor(
-            tTR_gC[(None, None, None, 0, 0)].shape, io_dtype
-        )
+        tTR_rC = cute.make_rmem_tensor(tTR_gC[(None, None, None, 0, 0)].shape, io_dtype)
 
         # [TMEM_STORE] 2. get smem_copy
 
@@ -337,10 +333,10 @@ def kernel(
         # ((ATOM_V, REST_V), EPI_M, EPI_N)
         bSG_sC, bSG_gC = cpasync.tma_partition(
             tma_atom_c,
-            0, # cluster coord
-            cute.make_layout(1), # cluster layout
-            cute.group_modes(sC, 0, 2), # (EPI_TILE_M, EPI_TILE_N), EPI_M, EPI_N, PIPE
-            cute.group_modes(tCgC_epi, 0, 2), # (EPI_TILE_M, EPI_TILE_N), EPI_M, EPI_N
+            0,  # cluster coord
+            cute.make_layout(1),  # cluster layout
+            cute.group_modes(sC, 0, 2),  # (EPI_TILE_M, EPI_TILE_N), EPI_M, EPI_N, PIPE
+            cute.group_modes(tCgC_epi, 0, 2),  # (EPI_TILE_M, EPI_TILE_N), EPI_M, EPI_N
         )
         # (EPI_TILE_M, EPI_TILE_N), (EPI_M, EPI_N)
         bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
@@ -528,7 +524,7 @@ def host_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, stream):
     # [TMEM_STORE] Compute epi_tile using sm100_utils
     ### Why is it 32? (The Architectural Reason)
     ###  The function is trying to maintain a constant **"Epilogue Tile Area"** defined by compute_elts.
-    ###  
+    ###
     ###  1.  **Memory Capacity**: 4096 FP16 elements occupy exactly **8 KB** ($4096 \times 2$ bytes).
     ###  2.  **Granularity**: By processing 4096 elements at a time, the kernel ensures that the Register File pressure is kept low. Each of the 128 threads in the CTA handles exactly **32 elements** ($4096 / 128$).
     ###  3.  **TMA Efficiency**: If use_tma_store is enabled, this 8 KB chunk fits perfectly into the SMEM buffers typically allocated for the epilogue stages.
@@ -670,6 +666,9 @@ def run_dense_gemm(
     warmup_iterations=10,
     iterations=100,
     skip_ref_check=False,
+    init_mode: str = "randint",
+    normal_mean: float = 0.0,
+    normal_std: float = 1.0,
 ):
     global torch, cutlass_torch
     import torch
@@ -679,6 +678,9 @@ def run_dense_gemm(
     print("Running Blackwell fp16 GEMM with Pair-UMMA + TMA Store:")
     print(f"  mnk:       {mnk}")
     print(f"  tolerance: {tolerance}")
+    print(f"  init_mode: {init_mode}")
+    if init_mode == "gaussian":
+        print(f"  normal_mean/std: {normal_mean}/{normal_std}")
     print("===================================================================")
     print()
 
@@ -694,11 +696,14 @@ def run_dense_gemm(
     ## Make K-major tensors (torch tensors are row-major)
     def make_tensors(mn, k, dtype):
         shape = (mn, k)
-        return (
-            torch.empty(*shape, dtype=torch.int32)
-            .random_(-2, 2)
-            .to(dtype=dtype, device="cuda")
-        )
+        t = torch.empty(*shape, dtype=torch.float32)
+        if init_mode == "randint":
+            t.random_(-2, 3)
+        elif init_mode == "gaussian":
+            t.normal_(mean=normal_mean, std=normal_std)
+        else:
+            raise ValueError(f"Unsupported init_mode: {init_mode}")
+        return t.to(dtype=dtype, device="cuda")
 
     def create_tensors(l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype):
         import torch
@@ -747,7 +752,6 @@ def run_dense_gemm(
     a_tensor, b_tensor, c_tensor, a_torch_cpu, b_torch_cpu, c_torch_cpu, c_torch_gpu = (
         create_tensors(l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype)
     )
-    print(a_tensor)
 
     # Get current CUDA stream from PyTorch
     torch_stream = torch.cuda.current_stream()
@@ -768,8 +772,8 @@ def run_dense_gemm(
         # Compute reference result
         ref = torch.einsum(
             "mk,nk->mn",
-            a_torch_cpu.to(dtype=torch.float32),
-            b_torch_cpu.to(dtype=torch.float32),
+            a_torch_cpu.to(dtype=torch.float16),
+            b_torch_cpu.to(dtype=torch.float16),
         )
 
         # Convert ref to c_dtype
@@ -829,6 +833,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
     )
+    parser.add_argument(
+        "--init_mode",
+        choices=["randint", "gaussian"],
+        default="randint",
+        help="Input initialization mode",
+    )
+    parser.add_argument(
+        "--normal_mean",
+        type=float,
+        default=0.0,
+        help="Gaussian mean when --init_mode gaussian",
+    )
+    parser.add_argument(
+        "--normal_std",
+        type=float,
+        default=1.0,
+        help="Gaussian std when --init_mode gaussian",
+    )
     args = parser.parse_args()
     if len(args.mnk) != 3:
         parser.error("--mnk must contain exactly 3 values")
@@ -838,5 +860,8 @@ if __name__ == "__main__":
     run_dense_gemm(
         args.mnk,
         args.tolerance,
+        init_mode=args.init_mode,
+        normal_mean=args.normal_mean,
+        normal_std=args.normal_std,
     )
     print("PASS")
