@@ -99,11 +99,14 @@ class PublicImportSurfaceTests(unittest.TestCase):
                 )
 
     def test_import_cutex_runtime_and_testing_modules(self) -> None:
+        cutex = importlib.import_module("cutex")
         runtime = importlib.import_module("cutex.runtime")
         upstream_runtime = importlib.import_module("cutlass.cute.runtime")
         testing = importlib.import_module("cutex.testing")
         upstream_testing = importlib.import_module("cutlass.cute.testing")
 
+        self.assertIs(cutex.runtime, runtime)
+        self.assertIs(cutex.testing, testing)
         self.assertIs(runtime.from_dlpack, upstream_runtime.from_dlpack)
         self.assertIs(runtime.make_fake_stream, upstream_runtime.make_fake_stream)
 

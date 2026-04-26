@@ -756,7 +756,7 @@ def run_dense_gemm(
     ):
         from cutex.runtime import make_fake_stream
 
-        stream = make_fake_stream()
+        stream = runtime.make_fake_stream()
         return cute.compile(host_function, a, b, c, max_active_clusters, stream)
 
     a_tensor, b_tensor, c_tensor, a_torch_cpu, b_torch_cpu, c_torch_cpu, c_torch_gpu = (
