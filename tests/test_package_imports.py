@@ -97,6 +97,36 @@ class PublicImportSurfaceTests(unittest.TestCase):
                     msg=f"cutex.utils.sm100.__all__ includes missing {name}",
                 )
 
+    def test_import_cutex_runtime_and_testing_modules(self) -> None:
+        runtime = importlib.import_module("cutex.runtime")
+        upstream_runtime = importlib.import_module("cutlass.cute.runtime")
+        testing = importlib.import_module("cutex.testing")
+        upstream_testing = importlib.import_module("cutlass.cute.testing")
+
+        self.assertIs(runtime.from_dlpack, upstream_runtime.from_dlpack)
+        self.assertIs(runtime.make_fake_stream, upstream_runtime.make_fake_stream)
+
+        upstream_runtime_public = {
+            name for name in dir(upstream_runtime) if not name.startswith("_")
+        }
+        self.assertTrue(set(runtime.__all__).issubset(upstream_runtime_public))
+        for name in runtime.__all__:
+            with self.subTest(module="cutex.runtime", exported_name=name):
+                self.assertTrue(
+                    hasattr(runtime, name),
+                    msg=f"cutex.runtime.__all__ includes missing {name}",
+                )
+
+        self.assertTrue(
+            set(testing.__all__).issubset(set(getattr(upstream_testing, "__all__", ())))
+        )
+        for name in testing.__all__:
+            with self.subTest(module="cutex.testing", exported_name=name):
+                self.assertTrue(
+                    hasattr(testing, name),
+                    msg=f"cutex.testing.__all__ includes missing {name}",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,8 +25,7 @@ import cutex as cute
 import cutex.utils as utils
 import cutex.pipeline as pipeline
 
-from cutex.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutex import cpasync, tcgen05, from_dlpack, testing
+from cutex import cpasync, tcgen05, from_dlpack, testing, runtime
 import cutex.utils.sm100 as sm100_utils
 
 import cuda.bindings.driver as cuda
@@ -755,7 +754,7 @@ def run_dense_gemm(
         c: cute.Tensor,
         max_active_clusters: cutlass.Constexpr = None,
     ):
-        from cutlass.cute.runtime import make_fake_stream
+        from cutex.runtime import make_fake_stream
 
         stream = make_fake_stream()
         return cute.compile(host_function, a, b, c, max_active_clusters, stream)
@@ -811,66 +810,3 @@ def run_dense_gemm(
     )
 
     return exec_time
-
-
-if __name__ == "__main__":
-
-    def parse_comma_separated_ints(s: str):
-        try:
-            return [int(x.strip()) for x in s.split(",")]
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                "Invalid format. Expected comma-separated integers."
-            )
-
-    from cuda.bindings import driver as cu_driver
-
-    cu_driver.cuInit(0)
-    err, device_count = cu_driver.cuDeviceGetCount()
-    if err != cu_driver.CUresult.CUDA_SUCCESS or device_count < 1:
-        raise RuntimeError("A GPU is required to run this example")
-
-    parser = argparse.ArgumentParser(
-        description="Blackwell fp16 GEMM with Pair-UMMA + TMA Store"
-    )
-    parser.add_argument(
-        "--mnk",
-        type=parse_comma_separated_ints,
-        default=[8192, 8192, 8192],
-        help="MNK dimensions (comma-separated)",
-    )
-    parser.add_argument(
-        "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
-    )
-    parser.add_argument(
-        "--init_mode",
-        choices=["randint", "gaussian"],
-        default="gaussian",
-        help="Input initialization mode",
-    )
-    parser.add_argument(
-        "--normal_mean",
-        type=float,
-        default=0.0,
-        help="Gaussian mean when --init_mode gaussian",
-    )
-    parser.add_argument(
-        "--normal_std",
-        type=float,
-        default=1.0,
-        help="Gaussian std when --init_mode gaussian",
-    )
-    args = parser.parse_args()
-    if len(args.mnk) != 3:
-        parser.error("--mnk must contain exactly 3 values")
-    if args.mnk[0] % mma_tiler_mnk[0] != 0 or args.mnk[1] % mma_tiler_mnk[1] != 0:
-        parser.error("m n must be divisible by mma_tiler_mn")
-
-    run_dense_gemm(
-        args.mnk,
-        args.tolerance,
-        init_mode=args.init_mode,
-        normal_mean=args.normal_mean,
-        normal_std=args.normal_std,
-    )
-    print("PASS")
