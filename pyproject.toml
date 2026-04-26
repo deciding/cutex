@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cutex"
+version = "0.1.0"
+dependencies = [
+    "flash_attn_4==4.0.0b4",
+]
+
+[tool.setuptools.packages.find]
+include = ["cutex", "cutex.*"]
