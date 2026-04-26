@@ -747,6 +747,7 @@ def run_dense_gemm(
     a_tensor, b_tensor, c_tensor, a_torch_cpu, b_torch_cpu, c_torch_cpu, c_torch_gpu = (
         create_tensors(l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype)
     )
+    print(a_tensor)
 
     # Get current CUDA stream from PyTorch
     torch_stream = torch.cuda.current_stream()
