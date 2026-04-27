@@ -94,6 +94,8 @@ def run_dense_gemm():
     os.environ["CUTE_DSL_DUMP_DIR"] = DUMP_DIR
     os.environ["CUTE_DSL_KEEP_PTX"] = "1"
     os.environ["CUTE_DSL_LINEINFO"] = "1"
+    os.environ["CUDA_PTXAS_FLAGS"] = "-v"
+    os.environ["CUTE_LOG_LEVEL"] = "DEBUG"
 
     DEVICE = torch.cuda.current_device()
     print(f"GPU: {torch.cuda.get_device_name(DEVICE)}")

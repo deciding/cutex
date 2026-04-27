@@ -30,6 +30,7 @@ import cutex.utils.sm100 as sm100_utils
 
 import cuda.bindings.driver as cuda
 
+# types, tiler, cluster, warp ids, stages
 io_dtype = cutlass.Float16
 acc_dtype = cutlass.Float32
 mma_inst_shape_mnk = (128, 256, 16)
@@ -53,9 +54,6 @@ acc_stage = 1
 num_c_stage = 2
 
 cluster_shape_mn = (2, 1)
-
-use_tma_store = True
-
 
 @cute.struct
 class SharedStorage:
@@ -84,7 +82,7 @@ def kernel(
     c_layout: cutlass.Constexpr,
     epi_tiler,
     use_2cta_instrs: cutlass.Constexpr,
-    c_smem_layout_staged,
+    c_smem_layout,
     tma_atom_c,
     mC_mn: cute.Tensor,
     tile_sched_params: utils.PersistentTileSchedulerParams,
@@ -113,14 +111,12 @@ def kernel(
     smem = cutlass.utils.SmemAllocator()
     storage = smem.allocate(SharedStorage)
 
-    sC = None
-    if cutlass.const_expr(use_tma_store):
-        sC = smem.allocate_tensor(
-            element_type=io_dtype,
-            layout=c_smem_layout_staged.outer,
-            byte_alignment=128,
-            swizzle=c_smem_layout_staged.inner,
-        )
+    sC = smem.allocate_tensor(
+        element_type=io_dtype,
+        layout=c_smem_layout.outer,
+        byte_alignment=128,
+        swizzle=c_smem_layout.inner,
+    )
 
     sA = smem.allocate_tensor(
         element_type=io_dtype,
@@ -157,9 +153,7 @@ def kernel(
     if warp_idx == tma_warp_id:
         cpasync.prefetch_descriptor(tma_atom_a)
         cpasync.prefetch_descriptor(tma_atom_b)
-
-        if cutlass.const_expr(use_tma_store):
-            cpasync.prefetch_descriptor(tma_atom_c)
+        cpasync.prefetch_descriptor(tma_atom_c)
 
     num_tma_copy_bytes = cute.size_in_bytes(
         io_dtype, cute.select(a_smem_layout, mode=[0, 1, 2])
@@ -196,14 +190,12 @@ def kernel(
         pipeline.PipelineUserType.Consumer, acc_stage
     )
 
-    c_pipeline = None
-    if cutlass.const_expr(use_tma_store):
-        c_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, threads_per_cta
-        )
-        c_pipeline = pipeline.PipelineTmaStore.create(
-            num_stages=num_c_stage, producer_group=c_producer_group
-        )
+    c_producer_group = pipeline.CooperativeGroup(
+        pipeline.Agent.Thread, threads_per_cta
+    )
+    c_pipeline = pipeline.PipelineTmaStore.create(
+        num_stages=num_c_stage, producer_group=c_producer_group
+    )
 
     gA = cute.local_tile(
         mA_mk, cute.slice_(mma_tiler_mnk, (None, 0, None)), (None, None)
@@ -256,85 +248,56 @@ def kernel(
 
     tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc.layout)
 
-    epi_smem_layout = None
-    bSG_sC, bSG_gC = None, None
-    tiled_copy_r2s, tRS_rC, tRS_sC = None, None, None
 
-    if cutlass.const_expr(use_tma_store):
-        epi_smem_layout = cute.slice_(c_smem_layout_staged, (None, None, 0))
+    epi_smem_layout = cute.slice_(c_smem_layout, (None, None, 0))
 
-        tmem_copy_atom = sm100_utils.get_tmem_load_op(
-            cta_tile_shape_mnk,
-            c_layout,
-            io_dtype,
-            acc_dtype,
-            epi_tiler,
-            use_2cta_instrs,
-        )
+    tmem_copy_atom = sm100_utils.get_tmem_load_op(
+        cta_tile_shape_mnk,
+        c_layout,
+        io_dtype,
+        acc_dtype,
+        epi_tiler,
+        use_2cta_instrs,
+    )
 
-        tCtAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tiler)
-        tmem_tiled_copy = tcgen05.make_tmem_copy(
-            tmem_copy_atom, tCtAcc_epi[None, None, 0, 0]
-        )
-        tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
+    tCtAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tiler)
+    tmem_tiled_copy = tcgen05.make_tmem_copy(
+        tmem_copy_atom, tCtAcc_epi[None, None, 0, 0]
+    )
+    tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
 
-        tTR_tAcc = tmem_thr_copy.partition_S(tCtAcc_epi)
+    tTR_tAcc = tmem_thr_copy.partition_S(tCtAcc_epi)
 
-        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+    tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
 
-        tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0, None, None)], epi_tiler)
+    tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0, None, None)], epi_tiler)
 
-        tTR_gC = tmem_thr_copy.partition_D(tCgC_epi)
+    tTR_gC = tmem_thr_copy.partition_D(tCgC_epi)
 
-        tTR_rAcc = cute.make_rmem_tensor(
-            tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, acc_dtype
-        )
-        tTR_rC = cute.make_rmem_tensor(
-            tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, io_dtype
-        )
+    tTR_rAcc = cute.make_rmem_tensor(
+        tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, acc_dtype
+    )
+    tTR_rC = cute.make_rmem_tensor(
+        tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, io_dtype
+    )
 
-        copy_atom_r2s = sm100_utils.get_smem_store_op(
-            c_layout, io_dtype, acc_dtype, tmem_tiled_copy
-        )
-        tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tmem_tiled_copy)
-        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+    copy_atom_r2s = sm100_utils.get_smem_store_op(
+        c_layout, io_dtype, acc_dtype, tmem_tiled_copy
+    )
+    tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tmem_tiled_copy)
+    thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
 
-        tRS_rC = tiled_copy_r2s.retile(tTR_rC)
+    tRS_rC = tiled_copy_r2s.retile(tTR_rC)
 
-        tRS_sC = thr_copy_r2s.partition_D(sC)
+    tRS_sC = thr_copy_r2s.partition_D(sC)
 
-        bSG_sC, bSG_gC = cpasync.tma_partition(
-            tma_atom_c,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sC, 0, 2),
-            cute.group_modes(tCgC_epi, 0, 2),
-        )
-    else:
-        epi_tiler = cta_tile_shape_mnk[:2]
-        tCtAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tiler)
-
-        gC_epi = cute.flat_divide(tCgC[((None, None), 0, 0, None, None)], epi_tiler)
-
-        tmem_copy_atom = sm100_utils.get_tmem_load_op(
-            cta_tile_shape_mnk,
-            c_layout,
-            io_dtype,
-            acc_dtype,
-            epi_tiler,
-            use_2cta_instrs,
-        )
-        tmem_tiled_copy = tcgen05.make_tmem_copy(
-            tmem_copy_atom, tCtAcc_epi[None, None, 0, 0]
-        )
-        tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
-
-        tDtC = tmem_thr_copy.partition_S(tCtAcc_epi)
-        tDgC = tmem_thr_copy.partition_D(gC_epi)
-        tCrAcc = cute.make_rmem_tensor(
-            tDgC[None, None, None, 0, 0, 0, 0].shape, acc_dtype
-        )
-        tCrC = cute.make_rmem_tensor(tDgC[None, None, None, 0, 0, 0, 0].shape, io_dtype)
+    bSG_sC, bSG_gC = cpasync.tma_partition(
+        tma_atom_c,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sC, 0, 2),
+        cute.group_modes(tCgC_epi, 0, 2),
+    )
 
     a_full_mcast_mask = None
     b_full_mcast_mask = None
@@ -445,51 +408,42 @@ def kernel(
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
 
-            if cutlass.const_expr(use_tma_store):
-                bSG_gC_tile = bSG_gC[
-                    None, None, None, mma_coord_mnk[0], mma_coord_mnk[1]
-                ]
-                bSG_gC_tile = cute.group_modes(bSG_gC_tile, 1, cute.rank(bSG_gC_tile))
+            bSG_gC_tile = bSG_gC[
+                None, None, None, mma_coord_mnk[0], mma_coord_mnk[1]
+            ]
+            bSG_gC_tile = cute.group_modes(bSG_gC_tile, 1, cute.rank(bSG_gC_tile))
 
-                subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                for subtile_idx in cutlass.range(subtile_cnt):
-                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
-                    cute.copy(tmem_tiled_copy, tTR_tAcc_mn, tTR_rAcc)
+            subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+            for subtile_idx in cutlass.range(subtile_cnt):
+                tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                cute.copy(tmem_tiled_copy, tTR_tAcc_mn, tTR_rAcc)
 
-                    acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                    tRS_rC.store(acc_vec.to(io_dtype))
+                acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                tRS_rC.store(acc_vec.to(io_dtype))
 
-                    num_tiles_executed = tile_sched.num_tiles_executed
-                    num_prev_subtiles = num_tiles_executed * subtile_cnt
-                    c_buffer = (num_prev_subtiles + subtile_idx) % num_c_stage
+                num_tiles_executed = tile_sched.num_tiles_executed
+                num_prev_subtiles = num_tiles_executed * subtile_cnt
+                c_buffer = (num_prev_subtiles + subtile_idx) % num_c_stage
+                cute.copy(
+                    tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)]
+                )
+
+                cute.arch.fence_proxy("async.shared", space="cta")
+
+                epilog_sync_barrier.arrive_and_wait()
+
+                if warp_idx == 0:
                     cute.copy(
-                        tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)]
+                        tma_atom_c,
+                        bSG_sC[(None, c_buffer)],
+                        bSG_gC_tile[(None, subtile_idx)],
                     )
 
-                    cute.arch.fence_proxy("async.shared", space="cta")
+                    c_pipeline.producer_commit()
+                    c_pipeline.producer_acquire()
 
-                    epilog_sync_barrier.arrive_and_wait()
+                epilog_sync_barrier.arrive_and_wait()
 
-                    if warp_idx == 0:
-                        cute.copy(
-                            tma_atom_c,
-                            bSG_sC[(None, c_buffer)],
-                            bSG_gC_tile[(None, subtile_idx)],
-                        )
-
-                        c_pipeline.producer_commit()
-                        c_pipeline.producer_acquire()
-
-                    epilog_sync_barrier.arrive_and_wait()
-
-            else:
-                simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), io_dtype)
-                tDtC = cute.group_modes(tDtC, 3, cute.rank(tDtC))
-                tDgC = cute.group_modes(tDgC, 3, cute.rank(tDgC))
-                for i in cutlass.range(cute.size(tDtC, mode=[3])):
-                    cute.copy(tmem_tiled_copy, tDtC[None, None, None, i], tCrAcc)
-                    tCrC.store(tCrAcc.load().to(io_dtype))
-                    cute.copy(simt_atom, tCrC, tDgC[(None, None, None, i)])
 
             with cute.arch.elect_one():
                 acc_pipeline.consumer_release(acc_consumer_state)
@@ -500,7 +454,7 @@ def kernel(
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
 
-
+# tiled_mma, c_layout/epi_tile, smem_layouts, tma_atoms, tma_tensors, tile_scheduler
 @cute.jit
 def host_function(
     a: cute.Tensor,
@@ -519,28 +473,6 @@ def host_function(
         mma_tiler_mnk[:2],
     )
 
-    use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
-
-    cluster_shape_mnl = (*cluster_shape_mn, 1)
-
-    cta_tile_shape_mnk = (
-        mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id.shape),
-        mma_tiler_mnk[1],
-        mma_tiler_mnk[2],
-    )
-
-    c_layout = utils.LayoutEnum.from_tensor(c)
-
-    if cutlass.const_expr(use_tma_store):
-        epi_tile = sm100_utils.compute_epilogue_tile_shape(
-            cta_tile_shape_mnk,
-            use_2cta_instrs,
-            c_layout,
-            io_dtype,
-        )
-    else:
-        epi_tile = cta_tile_shape_mnk[:2]
-
     a_smem_layout = sm100_utils.make_smem_layout_a(
         tiled_mma,
         mma_tiler_mnk,
@@ -556,23 +488,23 @@ def host_function(
     a_smem_layout_one_stage = cute.select(a_smem_layout, mode=[0, 1, 2])
     b_smem_layout_one_stage = cute.select(b_smem_layout, mode=[0, 1, 2])
 
-    c_smem_layout_staged = None
-    tma_atom_c = None
-    tma_tensor_c = None
-    if cutlass.const_expr(use_tma_store):
-        c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-            io_dtype,
-            c_layout,
-            epi_tile,
-            num_c_stage,
-        )
-        epi_smem_layout = cute.slice_(c_smem_layout_staged, (None, None, 0))
-        tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            c,
-            epi_smem_layout,
-            epi_tile,
-        )
+    c_layout = utils.LayoutEnum.from_tensor(c) # LayoutEnum.ROW_MAJOR
+    epi_tile = (cute.make_layout(128), cute.make_layout(64))
+
+    c_smem_layout = sm100_utils.make_smem_layout_epi(
+        io_dtype,
+        c_layout,
+        epi_tile,
+        num_c_stage,
+    )
+    epi_smem_layout = cute.select(c_smem_layout, mode=[0, 1])
+
+    tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileS2GOp(),
+        c,
+        epi_smem_layout,
+        epi_tile,
+    )
 
     cluster_layout_vmnk = cute.tiled_divide(
         cute.make_layout((*cluster_shape_mn, 1)),
@@ -585,12 +517,6 @@ def host_function(
     is_b_mcast = num_mcast_ctas_b > 1
 
     num_tma_producer = num_mcast_ctas_a + num_mcast_ctas_b - 1
-
-    print(f"7MIN tested")
-    print(f"cluster_layout_vmnk shape: {cluster_layout_vmnk.shape}")
-    print(f"num_mcast_ctas_a: {num_mcast_ctas_a}, num_mcast_ctas_b: {num_mcast_ctas_b}")
-    print(f"is_a_mcast: {is_a_mcast}, is_b_mcast: {is_b_mcast}")
-    print(f"use_tma_store: {use_tma_store}")
 
     a_op = sm100_utils.cluster_shape_to_tma_atom_A(cluster_shape_mn, tiled_mma.thr_id)
     a_tma_atom, a_tma_tensor = cute.nvgpu.make_tiled_tma_atom_A(
@@ -611,6 +537,16 @@ def host_function(
         cluster_layout_vmnk.shape,
     )
 
+    use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
+
+    cluster_shape_mnl = (*cluster_shape_mn, 1)
+
+    cta_tile_shape_mnk = (
+        mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id.shape),
+        mma_tiler_mnk[1],
+        mma_tiler_mnk[2],
+    )
+
     c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
     gc = cute.zipped_divide(c, tiler=c_shape)
     num_ctas_mn = gc[(0, (None, None))].shape
@@ -623,10 +559,11 @@ def host_function(
         tile_sched_params, max_active_clusters
     )
 
+    print(f"7MIN tested")
+
     print(f"cluster_layout_vmnk shape: {cluster_layout_vmnk.shape}")
     print(f"num_mcast_ctas_a: {num_mcast_ctas_a}, num_mcast_ctas_b: {num_mcast_ctas_b}")
     print(f"is_a_mcast: {is_a_mcast}, is_b_mcast: {is_b_mcast}")
-    print(f"use_tma_store: {use_tma_store}")
     print(f"grid_shape: {grid_shape}")
 
     kernel(
@@ -647,9 +584,9 @@ def host_function(
         c_layout,
         epi_tile,
         use_2cta_instrs,
-        c_smem_layout_staged,
+        c_smem_layout,
         tma_atom_c,
-        tma_tensor_c if use_tma_store else c,
+        tma_tensor_c,
         tile_sched_params,
     ).launch(
         grid=grid_shape,
