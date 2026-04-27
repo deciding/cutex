@@ -109,6 +109,7 @@ class PublicImportSurfaceTests(unittest.TestCase):
         self.assertIs(cutex.testing, testing)
         self.assertIs(runtime.from_dlpack, upstream_runtime.from_dlpack)
         self.assertIs(runtime.make_fake_stream, upstream_runtime.make_fake_stream)
+        self.assertIs(testing.benchmark, upstream_testing.benchmark)
 
         upstream_runtime_public = {
             name for name in dir(upstream_runtime) if not name.startswith("_")
@@ -121,9 +122,10 @@ class PublicImportSurfaceTests(unittest.TestCase):
                     msg=f"cutex.runtime.__all__ includes missing {name}",
                 )
 
-        self.assertTrue(
-            set(testing.__all__).issubset(set(getattr(upstream_testing, "__all__", ())))
-        )
+        upstream_testing_public = {
+            name for name in dir(upstream_testing) if not name.startswith("_")
+        }
+        self.assertTrue(set(testing.__all__).issubset(upstream_testing_public))
         for name in testing.__all__:
             with self.subTest(module="cutex.testing", exported_name=name):
                 self.assertTrue(
