@@ -21,12 +21,16 @@ from typing import Tuple, Optional, Union
 from functools import lru_cache
 
 import cutlass
-import cutex as cute
-import cutex.utils as utils
-import cutex.pipeline as pipeline
+import cutlass.cute as cute
+import cutlass.utils as utils
+import cutlass.pipeline as pipeline
 
-from cutex import cpasync, tcgen05, from_dlpack, testing, runtime
-import cutex.utils.sm100 as sm100_utils
+# [CLUSTER] Import pipeline_init functions for cluster support
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cutlass.cute.nvgpu import cpasync, tcgen05
+import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.cute.runtime import from_dlpack
+import cutlass.cute.testing as testing
 
 import cuda.bindings.driver as cuda
 
@@ -691,9 +695,9 @@ def run_dense_gemm(
         c: cute.Tensor,
         max_active_clusters: cutlass.Constexpr = None,
     ):
-        from cutex.runtime import make_fake_stream
+        from cutlass.cute.runtime import make_fake_stream
 
-        stream = runtime.make_fake_stream()
+        stream = make_fake_stream()
         return cute.compile(host_function, a, b, c, max_active_clusters, stream)
 
     a_tensor, b_tensor, c_tensor, a_torch_cpu, b_torch_cpu, c_torch_cpu, c_torch_gpu = (
