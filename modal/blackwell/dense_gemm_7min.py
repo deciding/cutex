@@ -22,6 +22,7 @@ from functools import lru_cache
 
 import cutlass
 import cutlass.cute as cute
+import cutez
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 
@@ -105,6 +106,21 @@ def kernel(
     mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
     is_leader_cta = mma_tile_coord_v == 0
 
+    #if tidx == 0 and bidx == 1 and bidy == 0 and bidz == 3:
+    #    cute.printf("cluster_layout_vmnk: {}", cluster_layout_vmnk)
+    #    cute.printf("cta_rank_in_cluster: {}", cta_rank_in_cluster)
+    #    cute.printf("block_in_cluster_coord_vmnk: {}", block_in_cluster_coord_vmnk)
+    #    lay = cute.make_layout((1, 4, 4, 1))
+    #    coord = lay.get_flat_coord(7)
+    #    mask = cute.make_layout_image_mask(lay, coord, mode=1)
+    #    cute.printf("coord1: {}", coord)
+    #    cute.printf("mask1: {}", mask)
+    #    lay = cute.make_layout(((2,), 2, 4, 1))
+    #    coord = lay.get_flat_coord(7)
+    #    mask = cute.make_layout_image_mask(lay, coord, mode=0)
+    #    cute.printf("coord2: {}", coord)
+    #    cute.printf("mask2: {}", mask)
+
 
     # smem
 
@@ -152,12 +168,15 @@ def kernel(
     tmem_ptr = tmem.retrieve_ptr(acc_dtype)
 
 
-    # tma
+    # tma prefetch
 
     if warp_idx == tma_warp_id:
         cpasync.prefetch_descriptor(tma_atom_a)
         cpasync.prefetch_descriptor(tma_atom_b)
         cpasync.prefetch_descriptor(tma_atom_c)
+
+
+    # pipeline
 
     num_tma_copy_bytes = cute.size_in_bytes(
         io_dtype, cute.select(a_smem_layout, mode=[0, 1, 2])
@@ -187,7 +206,7 @@ def kernel(
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
         consumer_group=pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            (2 if use_2cta_instrs else 1) * len(epilogue_warp_id),
+            (2 if use_2cta_instrs else 1) * len(epilogue_warp_id), # no * cute.arch.WARP_SIZE, must use elect_one in arrive
         ),
         barrier_storage=storage.acc_mbar_ptr.data_ptr(),
         cta_layout_vmnk=cluster_layout_vmnk,
@@ -199,15 +218,18 @@ def kernel(
         pipeline.PipelineUserType.Consumer, acc_stage
     )
 
-    c_producer_group = pipeline.CooperativeGroup(
-        pipeline.Agent.Thread, threads_per_cta
-    )
     c_pipeline = pipeline.PipelineTmaStore.create(
-        num_stages=num_c_stage, producer_group=c_producer_group
+        num_stages=num_c_stage,
+        producer_group=pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, threads_per_cta
+        )
     )
 
-    gA = cute.local_tile(
-        mA_mk, cute.slice_(mma_tiler_mnk, (None, 0, None)), (None, None)
+
+    # fragments
+
+    gA = cute.local_tile( # (bM, bK, RestM, RestK)
+        mA_mk, cute.select(mma_tiler_mnk, mode=[0, 2]), (None, None)
     )
 
     gB = cute.local_tile(
@@ -220,19 +242,22 @@ def kernel(
 
     thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
 
-    tCgA = thr_mma.partition_A(gA)
+    tCgA = thr_mma.partition_A(gA) # (MMA1, MMA2_M, MMA2_K, RestM, RestK), half on A and half on B, must use thr_mma to tell which half
 
     tCgB = thr_mma.partition_B(gB)
 
     tCgC = thr_mma.partition_C(gC_mn)
 
-    tCrA = tiled_mma.make_fragment_A(sA)
+    # frag: rmem ptr, tmem ptr, smem_desc_view. tma_tensor/smem_desc_view has no memspace
+    # make_fragment_* must have input already processed by parition_*, smem is treated as already partitioned(parition_shape_A/B)
+    tCrA = tiled_mma.make_fragment_A(sA) # (1, MMA_M, MMA_K, STAGE)
 
     tCrB = tiled_mma.make_fragment_B(sB)
 
-    acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
 
-    tCtAcc = tiled_mma.make_fragment_C(acc_shape)
+    acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2]) # (bM, bN)
+
+    tCtAcc = tiled_mma.make_fragment_C(acc_shape) # fake tmem, (MMA1, MMA2_M, MMA2_N)
 
     a_cta_layout = cute.make_layout(
         cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
@@ -240,6 +265,8 @@ def kernel(
     b_cta_layout = cute.make_layout(
         cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
     )
+    # (TMA, RestM, RestK)
+    # (TMA, STAGES)
     tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
         tma_atom_a,
         block_in_cluster_coord_vmnk[2],
@@ -255,12 +282,14 @@ def kernel(
         cute.group_modes(tCgB, 0, 3),
     )
 
+
     tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc.layout)
 
 
     epi_smem_layout = cute.slice_(c_smem_layout, (None, None, 0))
 
-    tmem_copy_atom = sm100_utils.get_tmem_load_op(
+    # better work with sm100_utils.compute_epilogue_tile_shape
+    tmem_copy_atom = sm100_utils.get_tmem_load_op( # e.g. Ld32x32b(x64)
         cta_tile_shape_mnk,
         c_layout,
         io_dtype,
@@ -268,21 +297,27 @@ def kernel(
         epi_tiler,
         use_2cta_instrs,
     )
-
+    # (EPIm, EPIn, EPI_M, EPI_N)
     tCtAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tiler)
+    # tmem_tensor just provide layout
     tmem_tiled_copy = tcgen05.make_tmem_copy(
         tmem_copy_atom, tCtAcc_epi[None, None, 0, 0]
     )
     tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
 
+    # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
     tTR_tAcc = tmem_thr_copy.partition_S(tCtAcc_epi)
 
+    # (T2R, T2R_M, T2R_N, (EPI_M, EPI_N))
     tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
 
+    # (EPIm, EPIn, EPI_M, EPI_N, RestM, RestN)
     tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0, None, None)], epi_tiler)
 
+    # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN)
+    # T2R is ((val, thr), 1) for tmem, and (val, 1) for rmem
     tTR_gC = tmem_thr_copy.partition_D(tCgC_epi)
-
+    # (T2R, T2R_M, T2R_N)
     tTR_rAcc = cute.make_rmem_tensor(
         tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, acc_dtype
     )
@@ -290,13 +325,27 @@ def kernel(
         tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, io_dtype
     )
 
-    copy_atom_r2s = sm100_utils.get_smem_store_op(
+    # cutez explain
+    cutez.explain_get_smem_store_op(
+        c_layout, io_dtype, acc_dtype, tmem_tiled_copy
+    )
+    copy_atom_r2s = sm100_utils.get_smem_store_op( # e.g. StMatrix8x8x16bOp(trans, 4)
         c_layout, io_dtype, acc_dtype, tmem_tiled_copy
     )
     tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tmem_tiled_copy)
     thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
 
+    # (R2S, R2S_M, R2S_N)
     tRS_rC = tiled_copy_r2s.retile(tTR_rC)
+    #if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
+    #    print(tmem_tiled_copy)
+    #    print(copy_atom_r2s)
+    #    print(tiled_copy_r2s)
+    #    #cute.printf("tTR_tAcc: {}", tTR_tAcc)
+    #    #cute.printf("tTR_gC: {}", tTR_gC)
+    #    cute.printf("tTR_rC: {}", tTR_rC)
+    #    cute.printf("tRS_rC: {}", tRS_rC)
+
 
     tRS_sC = thr_copy_r2s.partition_D(sC)
 
@@ -326,6 +375,8 @@ def kernel(
     )
     work_tile = tile_sched.initial_work_tile_info()
     num_k_tiles = cute.size(gA, mode=[3])
+
+
 
     if warp_idx == tma_warp_id:
         while work_tile.is_valid_tile:
@@ -458,8 +509,8 @@ def kernel(
                         bSG_gC_tile[(None, subtile_idx)],
                     )
 
-                    c_pipeline.producer_commit()
-                    c_pipeline.producer_acquire()
+                    c_pipeline.producer_commit() # cp.async.bulk.commit_group
+                    c_pipeline.producer_acquire() # cp.async.bulk.wait_group.read n-1
 
                 epilog_sync_barrier.arrive_and_wait()
 
@@ -468,7 +519,7 @@ def kernel(
                 acc_pipeline.consumer_release(acc_consumer_state)
             acc_consumer_state.advance()
 
-        c_pipeline.producer_tail()
+        c_pipeline.producer_tail() # cp.async.bulk.wait_group.read 0
 
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)

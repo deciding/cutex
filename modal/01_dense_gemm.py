@@ -59,15 +59,14 @@ cutlass_image = (
     cutlass_image.pip_install("torch", "pytest")
     .pip_install("nvidia-cutlass-dsl>=4.4.1")
     # .pip_install("jax", "jaxlib")
-    .pip_install("triton==3.5.1")
-    .pip_install("teraxlang==3.5.1.dev4")
     .add_local_dir(
         root_dir.parent / "dist",
         remote_path="/workspace/dist",
         copy=True,
     )
-    .run_commands("python -m pip install /workspace/dist/cutex-0.1.0-py3-none-any.whl")
-    .run_commands('python -c "import cutex"')
+    .run_commands("python -m pip install /workspace/dist/cutez-0.1.0-py3-none-any.whl")
+    .pip_install("triton==3.5.1")
+    .pip_install("teraxlang==3.5.1.dev4")
     .add_local_dir(
         root_dir / "blackwell",
         remote_path="/workspace/cuteDSL/blackwell",
