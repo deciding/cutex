@@ -216,3 +216,4 @@ def explain_get_smem_store_op(
         op = CopyUniversalOp()
     print(op)
     print("===========================================")
+    return cute.make_copy_atom(op, elem_ty_d, loc=loc, ip=ip)

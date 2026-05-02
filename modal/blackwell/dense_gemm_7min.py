@@ -325,11 +325,11 @@ def kernel(
         tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, io_dtype
     )
 
+    #copy_atom_r2s = sm100_utils.get_smem_store_op( # e.g. StMatrix8x8x16bOp(trans, 4)
+    #    c_layout, io_dtype, acc_dtype, tmem_tiled_copy
+    #)
     # cutez explain
-    cutez.explain_get_smem_store_op(
-        c_layout, io_dtype, acc_dtype, tmem_tiled_copy
-    )
-    copy_atom_r2s = sm100_utils.get_smem_store_op( # e.g. StMatrix8x8x16bOp(trans, 4)
+    copy_atom_r2s = cutez.explain_get_smem_store_op(
         c_layout, io_dtype, acc_dtype, tmem_tiled_copy
     )
     tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tmem_tiled_copy)

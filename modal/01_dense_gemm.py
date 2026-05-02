@@ -58,13 +58,23 @@ cutlass_image = (
 cutlass_image = (
     cutlass_image.pip_install("torch", "pytest")
     .pip_install("nvidia-cutlass-dsl>=4.4.1")
-    # .pip_install("jax", "jaxlib")
+
+    # cutez 1: local dir
     .add_local_dir(
-        root_dir.parent / "dist",
-        remote_path="/workspace/dist",
+        root_dir.parent / "cutez",
+        remote_path="/workspace/cutez",
         copy=True,
     )
-    .run_commands("python -m pip install /workspace/dist/cutez-0.1.0-py3-none-any.whl")
+    ## cutez 2: local build
+    #.add_local_dir(
+    #    root_dir.parent / "dist",
+    #    remote_path="/workspace/dist",
+    #    copy=True,
+    #)
+    #.run_commands("python -m pip install /workspace/dist/cutez-0.1.1-py3-none-any.whl")
+    ## cutez 3: pypi
+    #.pip_install("cutez==0.1.0")
+
     .pip_install("triton==3.5.1")
     .pip_install("teraxlang==3.5.1.dev4")
     .add_local_dir(
