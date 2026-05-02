@@ -51,12 +51,13 @@ from cutlass.cutlass_dsl import (
 from torch._prims_common import number_type
 
 @dsl_user_op
-def explain_get_smem_store_op(
+def get_smem_store_op(
     layout_d: LayoutEnum,
     elem_ty_d: Type[Numeric],
     elem_ty_acc: Type[Numeric],
     tiled_tmem_load: cute.TiledCopy,
     *,
+    verbose: bool=True,
     loc=None,
     ip=None,
 ) -> cute.CopyAtom:
@@ -190,17 +191,18 @@ def explain_get_smem_store_op(
             pack == Pack.NONE,
         ]
     )
-    print("===========================================")
-    print("explain_get_smem_store_op:")
-    if num_dp != 16 or num_bits < 128:
-        print("NOTE: to directly use stmatrix, tcgen05.ld must have 16 lanes and 128/256b instruction")
-    print(f"elem_ty_acc.width: {elem_ty_acc.width}")
-    print(f"elem_ty_d.width: {elem_ty_d.width}")
-    print(f"is_n_major: {is_n_major}")
-    print(f"num_dp: {num_dp}")
-    print(f"num_bits: {num_bits}")
-    print(f"num_rep: {num_rep}")
-    print(f"pack: {pack}")
+    if verbose:
+        print("===========================================")
+        print("Explain get_smem_store_op:")
+        if num_dp != 16 or num_bits < 128:
+            print("NOTE: to directly use stmatrix, tcgen05.ld must have 16 lanes and 128/256b instruction")
+        print(f"elem_ty_acc.width: {elem_ty_acc.width}")
+        print(f"elem_ty_d.width: {elem_ty_d.width}")
+        print(f"is_n_major: {is_n_major}")
+        print(f"num_dp: {num_dp}")
+        print(f"num_bits: {num_bits}")
+        print(f"num_rep: {num_rep}")
+        print(f"pack: {pack}")
 
     if use_stmatrix_m8n8_4x:
         op = StMatrix8x8x16bOp(is_m_major, 4)
@@ -214,6 +216,9 @@ def explain_get_smem_store_op(
         op = StMatrix16x8x8bOp(transpose=True, num_matrices=1)
     else:
         op = CopyUniversalOp()
-    print(op)
-    print("===========================================")
+
+    if verbose:
+        print(op)
+        print("===========================================")
+
     return cute.make_copy_atom(op, elem_ty_d, loc=loc, ip=ip)

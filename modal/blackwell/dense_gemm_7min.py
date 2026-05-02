@@ -127,6 +127,7 @@ def kernel(
     smem = cutlass.utils.SmemAllocator()
     storage = smem.allocate(SharedStorage)
 
+    # (EPIm, EPIn, STAGES)
     sC = smem.allocate_tensor(
         element_type=io_dtype,
         layout=c_smem_layout.outer,
@@ -134,6 +135,7 @@ def kernel(
         swizzle=c_smem_layout.inner,
     )
 
+    # (MMA1, MMA2_M, MMA2_K, STAGES)
     sA = smem.allocate_tensor(
         element_type=io_dtype,
         layout=a_smem_layout.outer,
@@ -226,45 +228,27 @@ def kernel(
     )
 
 
-    # fragments
+    # fragments MMA gX, tCrX
+    # fragments TMA_G2S tCgX, tXgX, tXsX
 
     gA = cute.local_tile( # (bM, bK, RestM, RestK)
         mA_mk, cute.select(mma_tiler_mnk, mode=[0, 2]), (None, None)
     )
-
     gB = cute.local_tile(
         mB_nk, cute.slice_(mma_tiler_mnk, (0, None, None)), (None, None)
     )
 
-    gC_mn = cute.local_tile(
-        mC_mn, cute.slice_(mma_tiler_mnk, (None, None, 0)), (None, None)
-    )
-
     thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
-
     tCgA = thr_mma.partition_A(gA) # (MMA1, MMA2_M, MMA2_K, RestM, RestK), half on A and half on B, must use thr_mma to tell which half
-
     tCgB = thr_mma.partition_B(gB)
-
-    tCgC = thr_mma.partition_C(gC_mn)
 
     # frag: rmem ptr, tmem ptr, smem_desc_view. tma_tensor/smem_desc_view has no memspace
     # make_fragment_* must have input already processed by parition_*, smem is treated as already partitioned(parition_shape_A/B)
     tCrA = tiled_mma.make_fragment_A(sA) # (1, MMA_M, MMA_K, STAGE)
-
     tCrB = tiled_mma.make_fragment_B(sB)
 
-
-    acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2]) # (bM, bN)
-
-    tCtAcc = tiled_mma.make_fragment_C(acc_shape) # fake tmem, (MMA1, MMA2_M, MMA2_N)
-
-    a_cta_layout = cute.make_layout(
-        cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
-    )
-    b_cta_layout = cute.make_layout(
-        cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-    )
+    a_cta_layout = cute.make_layout(cute.select(cluster_layout_vmnk, mode=[2]).shape)
+    b_cta_layout = cute.make_layout(cute.select(cluster_layout_vmnk, mode=[1]).shape)
     # (TMA, RestM, RestK)
     # (TMA, STAGES)
     tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
@@ -283,10 +267,14 @@ def kernel(
     )
 
 
+    # fragments MMA tCtAcc
+    # fragments T2R tEPItAcc, tTR_tAcc, tTR_rAcc, tTR_rC
+
+    acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2]) # (bM, bN)
+    tCtAcc = tiled_mma.make_fragment_C(acc_shape) # fake tmem, (MMA1, MMA2_M, MMA2_N)
     tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc.layout)
-
-
-    epi_smem_layout = cute.slice_(c_smem_layout, (None, None, 0))
+    # (EPIm, EPIn, EPI_M, EPI_N)
+    tEPItAcc = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tiler)
 
     # better work with sm100_utils.compute_epilogue_tile_shape
     tmem_copy_atom = sm100_utils.get_tmem_load_op( # e.g. Ld32x32b(x64)
@@ -297,26 +285,26 @@ def kernel(
         epi_tiler,
         use_2cta_instrs,
     )
-    # (EPIm, EPIn, EPI_M, EPI_N)
-    tCtAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tiler)
     # tmem_tensor just provide layout
     tmem_tiled_copy = tcgen05.make_tmem_copy(
-        tmem_copy_atom, tCtAcc_epi[None, None, 0, 0]
+        tmem_copy_atom, tEPItAcc[None, None, 0, 0]
     )
     tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
 
     # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
-    tTR_tAcc = tmem_thr_copy.partition_S(tCtAcc_epi)
-
+    tTR_tAcc = tmem_thr_copy.partition_S(tEPItAcc)
     # (T2R, T2R_M, T2R_N, (EPI_M, EPI_N))
     tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
 
+    gC_mn = cute.local_tile(
+        mC_mn, cute.slice_(mma_tiler_mnk, (None, None, 0)), (None, None)
+    )
+    tCgC = thr_mma.partition_C(gC_mn)
     # (EPIm, EPIn, EPI_M, EPI_N, RestM, RestN)
-    tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0, None, None)], epi_tiler)
-
+    tEPIgC = cute.flat_divide(tCgC[((None, None), 0, 0, None, None)], epi_tiler)
     # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN)
     # T2R is ((val, thr), 1) for tmem, and (val, 1) for rmem
-    tTR_gC = tmem_thr_copy.partition_D(tCgC_epi)
+    tTR_gC = tmem_thr_copy.partition_D(tEPIgC)
     # (T2R, T2R_M, T2R_N)
     tTR_rAcc = cute.make_rmem_tensor(
         tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, acc_dtype
@@ -325,11 +313,12 @@ def kernel(
         tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, io_dtype
     )
 
-    #copy_atom_r2s = sm100_utils.get_smem_store_op( # e.g. StMatrix8x8x16bOp(trans, 4)
-    #    c_layout, io_dtype, acc_dtype, tmem_tiled_copy
-    #)
+
+    # fragments R2S: tRS_rC, tRS_sC
+    # fragments TMA_S2G: bSG_sC, bSG_gC
+
     # cutez explain
-    copy_atom_r2s = cutez.explain_get_smem_store_op(
+    copy_atom_r2s = cutez.explain_get_smem_store_op( # e.g. StMatrix8x8x16bOp(trans, 4), CopyUniversal
         c_layout, io_dtype, acc_dtype, tmem_tiled_copy
     )
     tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tmem_tiled_copy)
@@ -337,34 +326,31 @@ def kernel(
 
     # (R2S, R2S_M, R2S_N)
     tRS_rC = tiled_copy_r2s.retile(tTR_rC)
-    #if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
-    #    print(tmem_tiled_copy)
-    #    print(copy_atom_r2s)
-    #    print(tiled_copy_r2s)
-    #    #cute.printf("tTR_tAcc: {}", tTR_tAcc)
-    #    #cute.printf("tTR_gC: {}", tTR_gC)
-    #    cute.printf("tTR_rC: {}", tTR_rC)
-    #    cute.printf("tRS_rC: {}", tRS_rC)
 
-
+    # (R2S, R2S_M, R2S_N, STAGES)
     tRS_sC = thr_copy_r2s.partition_D(sC)
 
+    # bSG_sC: (TMA, STAGES)
+    # bSG_gC: (TMA, EPI_M, EPI_N, RestM, RestN)
     bSG_sC, bSG_gC = cpasync.tma_partition(
         tma_atom_c,
         0,
         cute.make_layout(1),
         cute.group_modes(sC, 0, 2),
-        cute.group_modes(tCgC_epi, 0, 2),
+        cute.group_modes(tEPIgC, 0, 2),
     )
+
+
+    # mcast/work_tile
 
     a_full_mcast_mask = None
     b_full_mcast_mask = None
     if cutlass.const_expr(is_a_mcast or is_b_mcast or use_2cta_instrs):
-        a_full_mcast_mask = cpasync.create_tma_multicast_mask(
-            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
+        a_full_mcast_mask = cute.make_layout_image_mask(
+            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mode=2
         )
-        b_full_mcast_mask = cpasync.create_tma_multicast_mask(
-            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
+        b_full_mcast_mask = cute.make_layout_image_mask(
+            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mode=1
         )
 
 
@@ -375,7 +361,6 @@ def kernel(
     )
     work_tile = tile_sched.initial_work_tile_info()
     num_k_tiles = cute.size(gA, mode=[3])
-
 
 
     if warp_idx == tma_warp_id:

@@ -541,6 +541,14 @@ def run_dense_gemm():
         time_ms = us / 1000
         tflops7min = flops / time_ms / 1e9
         print(f"dense_gemm_7min: {time_ms:.4f} ms, {tflops7min:.2f} TFLOPS")
+        # Generate HTML viewers for all IR files in the dump directory
+        from teraxlang.tools.build_binding_view import generate_htmls
+
+        py_file = "/workspace/cuteDSL/blackwell/dense_gemm_7min.py"
+        generate_htmls(DUMP_DIR, py_file, verbose=True)
+
+        print(f"\nHTML viewers generated!")
+        print(f"to download and view: modal volume get {VOLUME_NAME} {dump_name}")
 
     print(f"\nDone! Results saved to: {DUMP_DIR}")
 
