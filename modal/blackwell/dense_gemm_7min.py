@@ -26,7 +26,6 @@ import cutez
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 
-# [CLUSTER] Import pipeline_init functions for cluster support
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -105,21 +104,6 @@ def kernel(
     )
     mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
     is_leader_cta = mma_tile_coord_v == 0
-
-    #if tidx == 0 and bidx == 1 and bidy == 0 and bidz == 3:
-    #    cute.printf("cluster_layout_vmnk: {}", cluster_layout_vmnk)
-    #    cute.printf("cta_rank_in_cluster: {}", cta_rank_in_cluster)
-    #    cute.printf("block_in_cluster_coord_vmnk: {}", block_in_cluster_coord_vmnk)
-    #    lay = cute.make_layout((1, 4, 4, 1))
-    #    coord = lay.get_flat_coord(7)
-    #    mask = cute.make_layout_image_mask(lay, coord, mode=1)
-    #    cute.printf("coord1: {}", coord)
-    #    cute.printf("mask1: {}", mask)
-    #    lay = cute.make_layout(((2,), 2, 4, 1))
-    #    coord = lay.get_flat_coord(7)
-    #    mask = cute.make_layout_image_mask(lay, coord, mode=0)
-    #    cute.printf("coord2: {}", coord)
-    #    cute.printf("mask2: {}", mask)
 
 
     # smem
@@ -219,6 +203,9 @@ def kernel(
     acc_consumer_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer, acc_stage
     )
+    epi_state = pipeline.make_pipeline_state(
+        pipeline.PipelineUserType.Consumer, num_c_stage
+    )
 
     c_pipeline = pipeline.PipelineTmaStore.create(
         num_stages=num_c_stage,
@@ -268,7 +255,7 @@ def kernel(
 
 
     # fragments MMA tCtAcc
-    # fragments T2R tEPItAcc, tTR_tAcc, tTR_rAcc, tTR_rC
+    # fragments T2R tEPItAcc, tTR_tAcc, tTR_rAcc
 
     acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2]) # (bM, bN)
     tCtAcc = tiled_mma.make_fragment_C(acc_shape) # fake tmem, (MMA1, MMA2_M, MMA2_N)
@@ -309,21 +296,22 @@ def kernel(
     tTR_rAcc = cute.make_rmem_tensor(
         tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, acc_dtype
     )
-    tTR_rC = cute.make_rmem_tensor(
-        tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, io_dtype
-    )
 
 
-    # fragments R2S: tRS_rC, tRS_sC
+    # fragments R2S: tTR_rC, tRS_rC, tRS_sC
     # fragments TMA_S2G: bSG_sC, bSG_gC
 
     # cutez explain
-    copy_atom_r2s = cutez.explain_get_smem_store_op( # e.g. StMatrix8x8x16bOp(trans, 4), CopyUniversal
+    copy_atom_r2s = cutez.get_smem_store_op( # e.g. StMatrix8x8x16bOp(trans, 4), CopyUniversal
         c_layout, io_dtype, acc_dtype, tmem_tiled_copy
     )
     tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tmem_tiled_copy)
     thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
 
+    # (T2R, T2R_M, T2R_N)
+    tTR_rC = cute.make_rmem_tensor(
+        tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, io_dtype
+    )
     # (R2S, R2S_M, R2S_N)
     tRS_rC = tiled_copy_r2s.retile(tTR_rC)
 
@@ -366,6 +354,7 @@ def kernel(
     if warp_idx == tma_warp_id:
         while work_tile.is_valid_tile:
             cur_tile_coord = work_tile.tile_idx
+            # (cluster_m, cluster_n, None)
             mma_coord_mnk = (
                 cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                 cur_tile_coord[1],
@@ -378,7 +367,7 @@ def kernel(
 
             ab_producer_state.reset_count()
 
-            for k_tile in cutlass.range(num_k_tiles, unroll=1):
+            for k_tile in cutlass.range(num_k_tiles, unroll=1): # no unrolling by default
                 ab_pipeline.producer_acquire(ab_producer_state)
                 cute.copy(
                     tma_atom_a,
@@ -416,7 +405,7 @@ def kernel(
 
             tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-            for k_tile_idx in cutlass.range(num_k_tiles):
+            for k_tile_idx in cutlass.range(num_k_tiles): # num of mma instrs
                 if is_leader_cta:
                     ab_pipeline.consumer_wait(ab_consumer_state)
                     num_k_blocks = cute.size(tCrA, mode=[2])
@@ -443,7 +432,6 @@ def kernel(
 
         acc_pipeline.producer_tail(acc_producer_state)
 
-    #if warp_idx < mma_warp_id:
     if warp_idx in epilogue_warp_id:
         epilog_sync_barrier = pipeline.NamedBarrier(
             barrier_id=epilog_sync_bar_id,
@@ -460,37 +448,34 @@ def kernel(
 
             acc_pipeline.consumer_wait(acc_consumer_state)
 
-            tile_sched.advance_to_next_work()
-            work_tile = tile_sched.get_current_work()
-
             bSG_gC_tile = bSG_gC[
                 None, None, None, mma_coord_mnk[0], mma_coord_mnk[1]
             ]
+            # (TMA, (EPI_M, EPI_N))
             bSG_gC_tile = cute.group_modes(bSG_gC_tile, 1, cute.rank(bSG_gC_tile))
 
+            # (T2R, T2R_M, T2R_N, (EPI_M, EPI_N))
             subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
             for subtile_idx in cutlass.range(subtile_cnt):
                 tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                 cute.copy(tmem_tiled_copy, tTR_tAcc_mn, tTR_rAcc)
 
+                # (R2S, R2S_M, R2S_N)
                 acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                 tRS_rC.store(acc_vec.to(io_dtype))
 
-                num_tiles_executed = tile_sched.num_tiles_executed
-                num_prev_subtiles = num_tiles_executed * subtile_cnt
-                c_buffer = (num_prev_subtiles + subtile_idx) % num_c_stage
                 cute.copy(
-                    tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)]
+                    tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, epi_state.index)]
                 )
 
                 cute.arch.fence_proxy("async.shared", space="cta")
 
-                epilog_sync_barrier.arrive_and_wait()
+                #epilog_sync_barrier.arrive_and_wait()
 
                 if warp_idx == 0:
                     cute.copy(
                         tma_atom_c,
-                        bSG_sC[(None, c_buffer)],
+                        bSG_sC[(None, epi_state.index)],
                         bSG_gC_tile[(None, subtile_idx)],
                     )
 
@@ -499,15 +484,19 @@ def kernel(
 
                 epilog_sync_barrier.arrive_and_wait()
 
+                epi_state.advance()
 
             with cute.arch.elect_one():
                 acc_pipeline.consumer_release(acc_consumer_state)
             acc_consumer_state.advance()
 
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
         c_pipeline.producer_tail() # cp.async.bulk.wait_group.read 0
 
-        tmem.relinquish_alloc_permit()
-        tmem.free(tmem_ptr)
+    tmem.relinquish_alloc_permit()
+    tmem.free(tmem_ptr)
 
 # tiled_mma, c_layout/epi_tile, smem_layouts, tma_atoms/tma_tensors, cluster/tile_scheduler/grid
 @cute.jit
