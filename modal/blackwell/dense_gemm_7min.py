@@ -6,7 +6,7 @@ CuTeDSL Dense GEMM with Pair-UMMA + TMA Store:
 | MMA Instruction Shape  | (128, 256, 16)|
 | MMA Tiler             | (256, 256, 64)|
 | Threads per CTA        | 128           |
-| Pipeline Stages        | 7 (AB), 1 (acc)|
+| Pipeline Stages        | 6 (AB), 1 (acc), 2 (c store)|
 | Cluster Shape          | (2, 1) - default |
 | CtaGroup               | TWO (pair-UMMA) |
 | TMA Store              | Enabled |
@@ -102,7 +102,7 @@ def kernel(
     block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
         cta_rank_in_cluster
     )
-    mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
+    mma_tile_coord_v = block_in_cluster_coord_vmnk[0]
     is_leader_cta = mma_tile_coord_v == 0
 
 
@@ -303,7 +303,7 @@ def kernel(
 
     # cutez explain
     copy_atom_r2s = cutez.get_smem_store_op( # e.g. StMatrix8x8x16bOp(trans, 4), CopyUniversal
-        c_layout, io_dtype, acc_dtype, tmem_tiled_copy
+        c_layout, io_dtype, acc_dtype, tmem_tiled_copy, verbose=False
     )
     tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tmem_tiled_copy)
     thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
