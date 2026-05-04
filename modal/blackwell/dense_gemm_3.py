@@ -107,7 +107,7 @@ def kernel(
     cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
     block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
         cta_rank_in_cluster
-    ) # column-major cta id within cluster
+    )  # column-major cta id within cluster
 
     #
     # 1. Prepare args
@@ -153,7 +153,8 @@ def kernel(
         num_stages=ab_stages,
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
         consumer_group=pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, num_tma_producer # number of participants
+            pipeline.Agent.Thread,
+            num_tma_producer,  # number of participants
         ),
         tx_count=num_tma_copy_bytes,
         barrier_storage=storage.ab_mbar_ptr.data_ptr(),
@@ -202,15 +203,15 @@ def kernel(
     # Partition tensors for TMA; This requires the tensors partitioned for MMA
     # [CLUSTER] Create CTA layouts from cluster_layout_vmnk
     a_cta_layout = cute.make_layout(
-        cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape # dim N
+        cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape  # dim N
     )
     b_cta_layout = cute.make_layout(
         cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
     )
     tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
         tma_atom_a,
-        block_in_cluster_coord_vmnk[2], # cta coord on N
-        a_cta_layout, # cta layout on dim N
+        block_in_cluster_coord_vmnk[2],  # cta coord on N
+        a_cta_layout,  # cta layout on dim N
         cute.group_modes(sA, 0, 3),
         cute.group_modes(tCgA, 0, 3),
     )
@@ -284,14 +285,14 @@ def kernel(
                 tAgA[(None, ab_empty.count)],
                 tAsA[(None, ab_empty.index)],
                 tma_bar_ptr=ab_empty.barrier,
-                mcast_mask=a_full_mcast_mask, # mcast
+                mcast_mask=a_full_mcast_mask,  # mcast
             )
             cute.copy(
                 tma_atom_b,
                 tBgB[(None, ab_empty.count)],
                 tBsB[(None, ab_empty.index)],
                 tma_bar_ptr=ab_empty.barrier,
-                mcast_mask=b_full_mcast_mask, # mcast
+                mcast_mask=b_full_mcast_mask,  # mcast
             )
 
             # Execute one K-block worth of MMA instructions
@@ -377,10 +378,14 @@ def host_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, stream):
     )
 
     # [CLUSTER] Compute multicast parameters
-    num_mcast_ctas_a = cute.size(cluster_layout_vmnk.shape[2]) # A multicast on dimension N
-    num_mcast_ctas_b = cute.size(cluster_layout_vmnk.shape[1]) # B multicast on dimension M
+    num_mcast_ctas_a = cute.size(
+        cluster_layout_vmnk.shape[2]
+    )  # A multicast on dimension N
+    num_mcast_ctas_b = cute.size(
+        cluster_layout_vmnk.shape[1]
+    )  # B multicast on dimension M
     is_a_mcast = num_mcast_ctas_a > 1
-    is_b_mcast = num_mcast_ctas_b > 1 # if only 2 cta, just B multicast
+    is_b_mcast = num_mcast_ctas_b > 1  # if only 2 cta, just B multicast
 
     # [CLUSTER] num_tma_producer for pipeline, 2 participants on dimension M
     num_tma_producer = num_mcast_ctas_a + num_mcast_ctas_b - 1
@@ -455,6 +460,9 @@ def run_dense_gemm(
     warmup_iterations=10,
     iterations=100,
     skip_ref_check=False,
+    init_mode: str = "randint",
+    normal_mean: float = 0.0,
+    normal_std: float = 1.0,
 ):
     global torch, cutlass_torch
     import torch
@@ -464,6 +472,9 @@ def run_dense_gemm(
     print("Running Blackwell fp16 GEMM example 2 with:")
     print(f"  mnk:       {mnk}")
     print(f"  tolerance: {tolerance}")
+    print(f"  init_mode: {init_mode}")
+    if init_mode == "gaussian":
+        print(f"  normal_mean/std: {normal_mean}/{normal_std}")
     print("===================================================================")
     print()
 
@@ -479,11 +490,14 @@ def run_dense_gemm(
     ## Make K-major tensors (torch tensors are row-major)
     def make_tensors(mn, k, dtype):
         shape = (mn, k)
-        return (
-            torch.empty(*shape, dtype=torch.int32)
-            .random_(-2, 2)
-            .to(dtype=dtype, device="cuda")
-        )
+        t = torch.empty(*shape, dtype=torch.float32)
+        if init_mode == "randint":
+            t.random_(-2, 3)
+        elif init_mode == "gaussian":
+            t.normal_(mean=normal_mean, std=normal_std)
+        else:
+            raise ValueError(f"Unsupported init_mode: {init_mode}")
+        return t.to(dtype=dtype, device="cuda")
 
     # a = make_tensors(m, k, cutlass_torch.dtype(io_dtype))
     # b = make_tensors(n, k, cutlass_torch.dtype(io_dtype))
@@ -582,8 +596,8 @@ def run_dense_gemm(
         # Compute reference result
         ref = torch.einsum(
             "mk,nk->mn",
-            a_torch_cpu.to(dtype=torch.float32),
-            b_torch_cpu.to(dtype=torch.float32),
+            a_torch_cpu.to(dtype=torch.float16),
+            b_torch_cpu.to(dtype=torch.float16),
         )
 
         # Convert ref to c_dtype
@@ -641,6 +655,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
     )
+    parser.add_argument(
+        "--init_mode",
+        choices=["randint", "gaussian"],
+        default="randint",
+        help="Input initialization mode",
+    )
+    parser.add_argument(
+        "--normal_mean",
+        type=float,
+        default=0.0,
+        help="Gaussian mean when --init_mode gaussian",
+    )
+    parser.add_argument(
+        "--normal_std",
+        type=float,
+        default=1.0,
+        help="Gaussian std when --init_mode gaussian",
+    )
     args = parser.parse_args()
     if len(args.mnk) != 3:
         parser.error("--mnk must contain exactly 3 values")
@@ -650,5 +682,8 @@ if __name__ == "__main__":
     run_dense_gemm(
         args.mnk,
         args.tolerance,
+        init_mode=args.init_mode,
+        normal_mean=args.normal_mean,
+        normal_std=args.normal_std,
     )
     print("PASS")

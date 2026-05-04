@@ -36,10 +36,6 @@ fa4_image = (
     .pip_install("flash-attn-4==4.0.0b4")
     .pip_install("teraxlang==3.5.1.dev4")
     .add_local_dir(root_dir / "fa4", remote_path="/workspace/fa4")
-    .add_local_dir(
-        root_dir / "third_party" / "flash-attention",
-        remote_path="/workspace/flash-attention-ref",
-    )
 )
 
 

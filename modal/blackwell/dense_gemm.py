@@ -1495,7 +1495,20 @@ class DenseGemmKernel:
         return can_implement
 
 
-def create_tensors(l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype):
+def create_tensors(
+    l,
+    m,
+    n,
+    k,
+    a_major,
+    b_major,
+    c_major,
+    ab_dtype,
+    c_dtype,
+    init_mode: str = "randint",
+    normal_mean: float = 0.0,
+    normal_std: float = 1.0,
+):
     import torch
     import cutlass.torch as cutlass_torch
 
@@ -1504,6 +1517,17 @@ def create_tensors(l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype):
     a_torch_cpu = cutlass_torch.matrix(l, m, k, a_major == "m", ab_dtype)
     b_torch_cpu = cutlass_torch.matrix(l, n, k, b_major == "n", ab_dtype)
     c_torch_cpu = cutlass_torch.matrix(l, m, n, c_major == "m", c_dtype)
+
+    if init_mode == "randint":
+        a_torch_cpu.random_(-2, 3)
+        b_torch_cpu.random_(-2, 3)
+        c_torch_cpu.random_(-2, 3)
+    elif init_mode == "gaussian":
+        a_torch_cpu.normal_(mean=normal_mean, std=normal_std)
+        b_torch_cpu.normal_(mean=normal_mean, std=normal_std)
+        c_torch_cpu.normal_(mean=normal_mean, std=normal_std)
+    else:
+        raise ValueError(f"Unsupported init_mode: {init_mode}")
 
     a_tensor, _ = cutlass_torch.cute_tensor_like(
         a_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
@@ -1536,8 +1560,8 @@ def compare(a_torch_cpu, b_torch_cpu, c_torch_gpu, c_dtype, tolerance):
     # Compute reference result
     ref = torch.einsum(
         "mkl,nkl->mnl",
-        a_torch_cpu.to(dtype=torch.float32),
-        b_torch_cpu.to(dtype=torch.float32),
+        a_torch_cpu.to(dtype=torch.float16),
+        b_torch_cpu.to(dtype=torch.float16),
     )
 
     # Convert ref to c_dtype
@@ -1567,6 +1591,9 @@ def run(
     iterations: int = 1,
     skip_ref_check: bool = False,
     use_cold_l2: bool = False,
+    init_mode: str = "randint",
+    normal_mean: float = 0.0,
+    normal_std: float = 1.0,
     **kwargs,
 ):
     """Execute a batched dense GEMM operation on Blackwell architecture with performance benchmarking.
@@ -1623,6 +1650,9 @@ def run(
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
     print(f"Use cold L2: {'True' if use_cold_l2 else 'False'}")
+    print(f"Init mode: {init_mode}")
+    if init_mode == "gaussian":
+        print(f"Gaussian params: mean={normal_mean}, std={normal_std}")
     import torch
 
     # Unpack parameters
@@ -1637,7 +1667,20 @@ def run(
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
 
     a_tensor, b_tensor, c_tensor, a_torch_cpu, b_torch_cpu, c_torch_cpu, c_torch_gpu = (
-        create_tensors(l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype)
+        create_tensors(
+            l,
+            m,
+            n,
+            k,
+            a_major,
+            b_major,
+            c_major,
+            ab_dtype,
+            c_dtype,
+            init_mode=init_mode,
+            normal_mean=normal_mean,
+            normal_std=normal_std,
+        )
     )
 
     # Build GEMM object
@@ -1764,6 +1807,24 @@ if __name__ == "__main__":
         default=False,
         help="Use circular buffer tensor sets to ensure L2 cold cache",
     )
+    parser.add_argument(
+        "--init_mode",
+        choices=["randint", "gaussian"],
+        default="randint",
+        help="Input initialization mode",
+    )
+    parser.add_argument(
+        "--normal_mean",
+        type=float,
+        default=0.0,
+        help="Gaussian mean when --init_mode gaussian",
+    )
+    parser.add_argument(
+        "--normal_std",
+        type=float,
+        default=1.0,
+        help="Gaussian std when --init_mode gaussian",
+    )
 
     args = parser.parse_args()
 
@@ -1793,6 +1854,9 @@ if __name__ == "__main__":
         args.iterations,
         args.skip_ref_check,
         args.use_cold_l2,
+        args.init_mode,
+        args.normal_mean,
+        args.normal_std,
     )
     print(f"{us}us per iter")
     print("PASS")

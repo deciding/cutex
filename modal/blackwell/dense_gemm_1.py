@@ -385,14 +385,18 @@ def kernel(
     #   3. Copy from register (tCrC) to global memory (tTRgC) - Float16
 
     # grouped shape: (tmem_atom, epi_tile_m, epi_tile_n, (mma_rest_m, mma_rest_n, tma_rest_m, tma_rest_n, RestM, RestN)) = (tmem_atom, epi_tile_m, epi_tile_n, other_rests)
-    tTRgC_tile = tTRgC[None, None, None, None, None, None, None, mma_coord_mnk[0], mma_coord_mnk[1]]
+    tTRgC_tile = tTRgC[
+        None, None, None, None, None, None, None, mma_coord_mnk[0], mma_coord_mnk[1]
+    ]
     tTRgC_tile = cute.group_modes(tTRgC_tile, 3, cute.rank(tTRgC_tile))
     for i in cutlass.range(cute.size(tTRtC, mode=[3])):  # mma_rest_m * mma_rest_n tiles
         cute.copy(
             tmem_tiled_copy, tTRtC[None, None, None, i], tCrAcc
         )  # TMEM -> Reg (Float32)
         tCrC.store(tCrAcc.load().to(io_dtype))  # Convert to Float16
-        cute.autovec_copy(tCrC, tTRgC_tile[None, None, None, i])  # Reg -> Global (Float16)
+        cute.autovec_copy(
+            tCrC, tTRgC_tile[None, None, None, i]
+        )  # Reg -> Global (Float16)
 
     # Deallocate TMEM
     pipeline.sync(barrier_id=1)
@@ -497,6 +501,9 @@ def run_dense_gemm(
     warmup_iterations=10,
     iterations=100,
     skip_ref_check=False,
+    init_mode: str = "randint",
+    normal_mean: float = 0.0,
+    normal_std: float = 1.0,
 ):
     global torch, cutlass_torch
     import torch
@@ -508,6 +515,9 @@ def run_dense_gemm(
     print("Running Blackwell fp16 GEMM example 1 with:")
     print(f"  mnk:       {mnk}")
     print(f"  tolerance: {tolerance}")
+    print(f"  init_mode: {init_mode}")
+    if init_mode == "gaussian":
+        print(f"  normal_mean/std: {normal_mean}/{normal_std}")
     print("===================================================================")
     print()
 
@@ -522,11 +532,14 @@ def run_dense_gemm(
 
     def make_tensors(mn, k, dtype):
         shape = (mn, k)
-        return (
-            torch.empty(*shape, dtype=torch.int32)
-            .random_(-2, 2)
-            .to(dtype=dtype, device="cuda")
-        )
+        t = torch.empty(*shape, dtype=torch.float32)
+        if init_mode == "randint":
+            t.random_(-2, 3)
+        elif init_mode == "gaussian":
+            t.normal_(mean=normal_mean, std=normal_std)
+        else:
+            raise ValueError(f"Unsupported init_mode: {init_mode}")
+        return t.to(dtype=dtype, device="cuda")
 
     def create_tensors(l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype):
         import torch
@@ -591,8 +604,8 @@ def run_dense_gemm(
 
         ref = torch.einsum(
             "mk,nk->mn",
-            a_torch_cpu.to(dtype=torch.float32),
-            b_torch_cpu.to(dtype=torch.float32),
+            a_torch_cpu.to(dtype=torch.float16),
+            b_torch_cpu.to(dtype=torch.float16),
         )
 
         _, ref_torch_gpu = cutlass_torch.cute_tensor_like(
@@ -648,6 +661,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
     )
+    parser.add_argument(
+        "--init_mode",
+        choices=["randint", "gaussian"],
+        default="randint",
+        help="Input initialization mode",
+    )
+    parser.add_argument(
+        "--normal_mean",
+        type=float,
+        default=0.0,
+        help="Gaussian mean when --init_mode gaussian",
+    )
+    parser.add_argument(
+        "--normal_std",
+        type=float,
+        default=1.0,
+        help="Gaussian std when --init_mode gaussian",
+    )
     args = parser.parse_args()
     if len(args.mnk) != 3:
         parser.error("--mnk must contain exactly 3 values")
@@ -657,5 +688,8 @@ if __name__ == "__main__":
     run_dense_gemm(
         args.mnk,
         args.tolerance,
+        init_mode=args.init_mode,
+        normal_mean=args.normal_mean,
+        normal_std=args.normal_std,
     )
     print("PASS")

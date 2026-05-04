@@ -227,28 +227,28 @@ def kernel(
     num_k_tiles = cute.size(gA, mode=[2])
     if warp_idx == 0:
         # Wait for a empty accumulator buffer
-        acc_empty = acc_producer.acquire_and_advance()
+        acc_producer_handle = acc_producer.acquire_and_advance()
         for k_tile_idx in cutlass.range(num_k_tiles, prefetch_stages=ab_stages - 2):
             # Issue TMA loads
-            ab_empty = ab_producer.acquire_and_advance()
+            ab_producer_handle = ab_producer.acquire_and_advance()
             cute.copy(
                 tma_atom_a,
-                tAgA[(None, ab_empty.count)],
-                tAsA[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
+                tAgA[(None, ab_producer_handle.count)],
+                tAsA[(None, ab_producer_handle.index)],
+                tma_bar_ptr=ab_producer_handle.barrier,
             )
             cute.copy(
                 tma_atom_b,
-                tBgB[(None, ab_empty.count)],
-                tBsB[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
+                tBgB[(None, ab_producer_handle.count)],
+                tBsB[(None, ab_producer_handle.index)],
+                tma_bar_ptr=ab_producer_handle.barrier,
             )
 
             # Execute one K-block worth of MMA instructions
-            ab_full = ab_consumer.wait_and_advance()
+            ab_consumer_handle = ab_consumer.wait_and_advance()
             num_k_blocks = cute.size(tCrA, mode=[2])
             for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                k_block_coord = (None, None, k_block_idx, ab_full.index)
+                k_block_coord = (None, None, k_block_idx, ab_consumer_handle.index)
                 cute.gemm(
                     tiled_mma,
                     tCtAcc,
@@ -259,10 +259,10 @@ def kernel(
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
             # Signal that the A/B buffers have been consumed and are ready for the next load
-            ab_full.release()
+            ab_consumer_handle.release()
 
         # Signal that the accumulator is fully computed
-        acc_empty.commit()
+        acc_producer_handle.commit()
 
     #
     # 3. Epilogue
@@ -368,6 +368,9 @@ def run_dense_gemm(
     warmup_iterations=10,
     iterations=100,
     skip_ref_check=False,
+    init_mode: str = "randint",
+    normal_mean: float = 0.0,
+    normal_std: float = 1.0,
 ):
     global torch, cutlass_torch
     import torch
@@ -377,6 +380,9 @@ def run_dense_gemm(
     print("Running Blackwell fp16 GEMM example 2 with:")
     print(f"  mnk:       {mnk}")
     print(f"  tolerance: {tolerance}")
+    print(f"  init_mode: {init_mode}")
+    if init_mode == "gaussian":
+        print(f"  normal_mean/std: {normal_mean}/{normal_std}")
     print("===================================================================")
     print()
 
@@ -392,11 +398,14 @@ def run_dense_gemm(
     ## Make K-major tensors (torch tensors are row-major)
     def make_tensors(mn, k, dtype):
         shape = (mn, k)
-        return (
-            torch.empty(*shape, dtype=torch.int32)
-            .random_(-2, 2)
-            .to(dtype=dtype, device="cuda")
-        )
+        t = torch.empty(*shape, dtype=torch.float32)
+        if init_mode == "randint":
+            t.random_(-2, 3)
+        elif init_mode == "gaussian":
+            t.normal_(mean=normal_mean, std=normal_std)
+        else:
+            raise ValueError(f"Unsupported init_mode: {init_mode}")
+        return t.to(dtype=dtype, device="cuda")
 
     # a = make_tensors(m, k, cutlass_torch.dtype(io_dtype))
     # b = make_tensors(n, k, cutlass_torch.dtype(io_dtype))
@@ -495,8 +504,8 @@ def run_dense_gemm(
         # Compute reference result
         ref = torch.einsum(
             "mk,nk->mn",
-            a_torch_cpu.to(dtype=torch.float32),
-            b_torch_cpu.to(dtype=torch.float32),
+            a_torch_cpu.to(dtype=torch.float16),
+            b_torch_cpu.to(dtype=torch.float16),
         )
 
         # Convert ref to c_dtype
@@ -554,6 +563,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
     )
+    parser.add_argument(
+        "--init_mode",
+        choices=["randint", "gaussian"],
+        default="randint",
+        help="Input initialization mode",
+    )
+    parser.add_argument(
+        "--normal_mean",
+        type=float,
+        default=0.0,
+        help="Gaussian mean when --init_mode gaussian",
+    )
+    parser.add_argument(
+        "--normal_std",
+        type=float,
+        default=1.0,
+        help="Gaussian std when --init_mode gaussian",
+    )
     args = parser.parse_args()
     if len(args.mnk) != 3:
         parser.error("--mnk must contain exactly 3 values")
@@ -563,5 +590,8 @@ if __name__ == "__main__":
     run_dense_gemm(
         args.mnk,
         args.tolerance,
+        init_mode=args.init_mode,
+        normal_mean=args.normal_mean,
+        normal_std=args.normal_std,
     )
     print("PASS")
