@@ -44,6 +44,10 @@ def autotune(
     return decorator
 
 
-def get_autotune_spec(kernel) -> AutotuneSpec | None:
+def read_autotune_spec(kernel) -> AutotuneSpec | None:
     call = getattr(kernel, "__call__", None)
     return getattr(call, "__cutez_autotune__", None)
+
+
+def get_autotune_spec(kernel) -> AutotuneSpec | None:
+    return read_autotune_spec(kernel)
