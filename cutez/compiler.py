@@ -27,6 +27,15 @@ def _format_candidate_failures(failures):
 
 
 def _tuning_key(kernel, spec, runtime_key_values):
+    missing_name = next(
+        (name for name in spec.key if name not in runtime_key_values), None
+    )
+    if missing_name is not None:
+        available_keys = ", ".join(sorted(runtime_key_values)) or "none"
+        raise AutotuneError(
+            f"missing autotune key field '{missing_name}' in resolved key values; "
+            f"available keys: {available_keys}"
+        )
     return (type(kernel), tuple(runtime_key_values[name] for name in spec.key))
 
 
@@ -119,9 +128,13 @@ def compile(kernel, *args, **kwargs):
                 except Exception as exc:
                     failures.append((_config_label(config), exc))
                     continue
-            timed = do_bench(
-                compiled, *args, warmup=spec.warmup, rep=spec.rep, **kwargs
-            )
+            try:
+                timed = do_bench(
+                    compiled, *args, warmup=spec.warmup, rep=spec.rep, **kwargs
+                )
+            except Exception as exc:
+                failures.append((_config_label(config), exc))
+                continue
             if best_time is None or timed < best_time:
                 best_time = timed
                 best_compiled = compiled
