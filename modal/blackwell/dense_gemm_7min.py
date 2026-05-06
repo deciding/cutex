@@ -18,7 +18,6 @@ Step 3: Added TMA Store for direct SMEM->GMEM stores.
 
 import argparse
 from typing import Tuple, Optional, Union
-from functools import lru_cache
 
 import cutlass
 import cutlass.cute as cute
@@ -43,6 +42,7 @@ mma_tiler_mnk = (
     256,
     64,
 )
+mma_tile_k = mma_tiler_mnk[2]
 
 epilogue_warp_id = (0, 1, 2, 3)
 mma_warp_id = 4
@@ -58,6 +58,12 @@ acc_stage = 1
 num_c_stage = 2
 
 cluster_shape_mn = (2, 1)
+
+AUTOTUNE_CONFIGS = [
+    cutez.Config(kwargs={"mma_tiler_mn": (256, 256), "cluster_shape_mn": (2, 1)}),
+    cutez.Config(kwargs={"mma_tiler_mn": (128, 256), "cluster_shape_mn": (1, 1)}),
+]
+
 
 @cute.struct
 class SharedStorage:
@@ -104,7 +110,6 @@ def kernel(
     )
     mma_tile_coord_v = block_in_cluster_coord_vmnk[0]
     is_leader_cta = mma_tile_coord_v == 0
-
 
     # smem
 
@@ -153,14 +158,12 @@ def kernel(
     tmem.wait_for_alloc()
     tmem_ptr = tmem.retrieve_ptr(acc_dtype)
 
-
     # tma prefetch
 
     if warp_idx == tma_warp_id:
         cpasync.prefetch_descriptor(tma_atom_a)
         cpasync.prefetch_descriptor(tma_atom_b)
         cpasync.prefetch_descriptor(tma_atom_c)
-
 
     # pipeline
 
@@ -171,12 +174,12 @@ def kernel(
 
     ab_pipeline = pipeline.PipelineTmaUmma.create(
         num_stages=ab_stages,
-        producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread), # must be 1
+        producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),  # must be 1
         consumer_group=pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            num_tma_producer, # cluster_m - cluster_n + 1, nothing related to cluster_v
+            num_tma_producer,  # cluster_m - cluster_n + 1, nothing related to cluster_v
         ),
-        tx_count=num_tma_copy_bytes, # doubled for 2cta
+        tx_count=num_tma_copy_bytes,  # doubled for 2cta
         barrier_storage=storage.ab_mbar_ptr.data_ptr(),
         cta_layout_vmnk=cluster_layout_vmnk,
     )
@@ -192,7 +195,10 @@ def kernel(
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
         consumer_group=pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            (2 if use_2cta_instrs else 1) * len(epilogue_warp_id), # no * cute.arch.WARP_SIZE, must use elect_one in arrive
+            (2 if use_2cta_instrs else 1)
+            * len(
+                epilogue_warp_id
+            ),  # no * cute.arch.WARP_SIZE, must use elect_one in arrive
         ),
         barrier_storage=storage.acc_mbar_ptr.data_ptr(),
         cta_layout_vmnk=cluster_layout_vmnk,
@@ -211,14 +217,13 @@ def kernel(
         num_stages=num_c_stage,
         producer_group=pipeline.CooperativeGroup(
             pipeline.Agent.Thread, threads_per_cta
-        )
+        ),
     )
-
 
     # fragments MMA gX, tCrX
     # fragments TMA_G2S tCgX, tXgX, tXsX
 
-    gA = cute.local_tile( # (bM, bK, RestM, RestK)
+    gA = cute.local_tile(  # (bM, bK, RestM, RestK)
         mA_mk, cute.select(mma_tiler_mnk, mode=[0, 2]), (None, None)
     )
     gB = cute.local_tile(
@@ -226,12 +231,14 @@ def kernel(
     )
 
     thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
-    tCgA = thr_mma.partition_A(gA) # (MMA1, MMA2_M, MMA2_K, RestM, RestK), half on A and half on B, must use thr_mma to tell which half
+    tCgA = thr_mma.partition_A(
+        gA
+    )  # (MMA1, MMA2_M, MMA2_K, RestM, RestK), half on A and half on B, must use thr_mma to tell which half
     tCgB = thr_mma.partition_B(gB)
 
     # frag: rmem ptr, tmem ptr, smem_desc_view. tma_tensor/smem_desc_view has no memspace
     # make_fragment_* must have input already processed by parition_*, smem is treated as already partitioned(parition_shape_A/B)
-    tCrA = tiled_mma.make_fragment_A(sA) # (1, MMA_M, MMA_K, STAGE)
+    tCrA = tiled_mma.make_fragment_A(sA)  # (1, MMA_M, MMA_K, STAGE)
     tCrB = tiled_mma.make_fragment_B(sB)
 
     a_cta_layout = cute.make_layout(cute.select(cluster_layout_vmnk, mode=[2]).shape)
@@ -253,18 +260,17 @@ def kernel(
         cute.group_modes(tCgB, 0, 3),
     )
 
-
     # fragments MMA tCtAcc
     # fragments T2R tEPItAcc, tTR_tAcc, tTR_rAcc
 
-    acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2]) # (bM, bN)
-    tCtAcc = tiled_mma.make_fragment_C(acc_shape) # fake tmem, (MMA1, MMA2_M, MMA2_N)
+    acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])  # (bM, bN)
+    tCtAcc = tiled_mma.make_fragment_C(acc_shape)  # fake tmem, (MMA1, MMA2_M, MMA2_N)
     tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc.layout)
     # (EPIm, EPIn, EPI_M, EPI_N)
     tEPItAcc = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tiler)
 
     # better work with sm100_utils.compute_epilogue_tile_shape
-    tmem_copy_atom = sm100_utils.get_tmem_load_op( # e.g. Ld32x32b(x64)
+    tmem_copy_atom = sm100_utils.get_tmem_load_op(  # e.g. Ld32x32b(x64)
         cta_tile_shape_mnk,
         c_layout,
         io_dtype,
@@ -273,9 +279,7 @@ def kernel(
         use_2cta_instrs,
     )
     # tmem_tensor just provide layout
-    tmem_tiled_copy = tcgen05.make_tmem_copy(
-        tmem_copy_atom, tEPItAcc[None, None, 0, 0]
-    )
+    tmem_tiled_copy = tcgen05.make_tmem_copy(tmem_copy_atom, tEPItAcc[None, None, 0, 0])
     tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
 
     # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
@@ -297,13 +301,14 @@ def kernel(
         tTR_gC[(None, None, None, 0, 0, 0, 0)].shape, acc_dtype
     )
 
-
     # fragments R2S: tTR_rC, tRS_rC, tRS_sC
     # fragments TMA_S2G: bSG_sC, bSG_gC
 
     # cutez explain
-    copy_atom_r2s = cutez.get_smem_store_op( # e.g. StMatrix8x8x16bOp(trans, 4), CopyUniversal
-        c_layout, io_dtype, acc_dtype, tmem_tiled_copy, verbose=False
+    copy_atom_r2s = (
+        cutez.get_smem_store_op(  # e.g. StMatrix8x8x16bOp(trans, 4), CopyUniversal
+            c_layout, io_dtype, acc_dtype, tmem_tiled_copy, verbose=False
+        )
     )
     tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tmem_tiled_copy)
     thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
@@ -328,7 +333,6 @@ def kernel(
         cute.group_modes(tEPIgC, 0, 2),
     )
 
-
     # mcast/work_tile
 
     a_full_mcast_mask = None
@@ -341,7 +345,6 @@ def kernel(
             cluster_layout_vmnk, block_in_cluster_coord_vmnk, mode=1
         )
 
-
     tile_sched = utils.StaticPersistentTileScheduler.create(
         tile_sched_params,
         cute.arch.block_idx(),
@@ -349,7 +352,6 @@ def kernel(
     )
     work_tile = tile_sched.initial_work_tile_info()
     num_k_tiles = cute.size(gA, mode=[3])
-
 
     if warp_idx == tma_warp_id:
         while work_tile.is_valid_tile:
@@ -367,7 +369,9 @@ def kernel(
 
             ab_producer_state.reset_count()
 
-            for k_tile in cutlass.range(num_k_tiles, unroll=1): # no unrolling by default
+            for k_tile in cutlass.range(
+                num_k_tiles, unroll=1
+            ):  # no unrolling by default
                 ab_pipeline.producer_acquire(ab_producer_state)
                 cute.copy(
                     tma_atom_a,
@@ -405,12 +409,17 @@ def kernel(
 
             tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-            for k_tile_idx in cutlass.range(num_k_tiles): # num of mma instrs
+            for k_tile_idx in cutlass.range(num_k_tiles):  # num of mma instrs
                 if is_leader_cta:
                     ab_pipeline.consumer_wait(ab_consumer_state)
                     num_k_blocks = cute.size(tCrA, mode=[2])
                     for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                        k_block_coord = (None, None, k_block_idx, ab_consumer_state.index)
+                        k_block_coord = (
+                            None,
+                            None,
+                            k_block_idx,
+                            ab_consumer_state.index,
+                        )
                         cute.gemm(
                             tiled_mma,
                             tCtAcc,
@@ -448,9 +457,7 @@ def kernel(
 
             acc_pipeline.consumer_wait(acc_consumer_state)
 
-            bSG_gC_tile = bSG_gC[
-                None, None, None, mma_coord_mnk[0], mma_coord_mnk[1]
-            ]
+            bSG_gC_tile = bSG_gC[None, None, None, mma_coord_mnk[0], mma_coord_mnk[1]]
             # (TMA, (EPI_M, EPI_N))
             bSG_gC_tile = cute.group_modes(bSG_gC_tile, 1, cute.rank(bSG_gC_tile))
 
@@ -470,7 +477,7 @@ def kernel(
 
                 cute.arch.fence_proxy("async.shared", space="cta")
 
-                #epilog_sync_barrier.arrive_and_wait()
+                # epilog_sync_barrier.arrive_and_wait()
 
                 if warp_idx == 0:
                     cute.copy(
@@ -479,8 +486,8 @@ def kernel(
                         bSG_gC_tile[(None, subtile_idx)],
                     )
 
-                    c_pipeline.producer_commit() # cp.async.bulk.commit_group
-                    c_pipeline.producer_acquire() # cp.async.bulk.wait_group.read n-1
+                    c_pipeline.producer_commit()  # cp.async.bulk.commit_group
+                    c_pipeline.producer_acquire()  # cp.async.bulk.wait_group.read n-1
 
                 epilog_sync_barrier.arrive_and_wait()
 
@@ -493,12 +500,14 @@ def kernel(
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
 
-        c_pipeline.producer_tail() # cp.async.bulk.wait_group.read 0
+        c_pipeline.producer_tail()  # cp.async.bulk.wait_group.read 0
 
     tmem.relinquish_alloc_permit()
     tmem.free(tmem_ptr)
 
+
 # tiled_mma, c_layout/epi_tile, smem_layouts, tma_atoms/tma_tensors, cluster/tile_scheduler/grid
+@cutez.autotune(configs=AUTOTUNE_CONFIGS, key=["m", "n", "k"])
 @cute.jit
 def host_function(
     a: cute.Tensor,
@@ -506,7 +515,10 @@ def host_function(
     c: cute.Tensor,
     max_active_clusters: cutlass.Constexpr,
     stream: cuda.CUstream,
+    mma_tiler_mn,
+    cluster_shape_mn,
 ):
+    mma_tiler_mnk = (*mma_tiler_mn, mma_tile_k)
 
     # A, B
 
@@ -558,10 +570,9 @@ def host_function(
         cluster_layout_vmnk.shape,
     )
 
-
     # C
 
-    c_layout = utils.LayoutEnum.from_tensor(c) # LayoutEnum.ROW_MAJOR
+    c_layout = utils.LayoutEnum.from_tensor(c)  # LayoutEnum.ROW_MAJOR
     epi_tile = (cute.make_layout(128), cute.make_layout(64))
 
     c_smem_layout = sm100_utils.make_smem_layout_epi(
@@ -579,7 +590,6 @@ def host_function(
         epi_tile,
     )
 
-
     # mcast
 
     num_mcast_ctas_a = cute.size(cluster_layout_vmnk.shape[2])
@@ -590,7 +600,6 @@ def host_function(
 
     use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
-
     # tile scheduler
 
     cluster_shape_mnl = (*cluster_shape_mn, 1)
@@ -599,7 +608,7 @@ def host_function(
         mma_tiler_mnk[1],
         mma_tiler_mnk[2],
     )
-    #c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
+    # c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
     c_shape = cute.select(cta_tile_shape_mnk, mode=[0, 1])
     gc = cute.zipped_divide(c, tiler=c_shape)
     num_ctas_mn = gc[(0, (None, None))].shape
@@ -646,6 +655,17 @@ def host_function(
         cluster=cluster_shape_mnl,
         stream=stream,
     )
+
+
+host_function.autotune_init_kwargs = lambda: {
+    "mma_tiler_mn": mma_tiler_mnk[:2],
+    "cluster_shape_mn": cluster_shape_mn,
+}
+host_function.autotune_key_values = lambda a, b, c, *args, **kwargs: {
+    "m": a.shape[0],
+    "n": b.shape[0],
+    "k": a.shape[1],
+}
 
 
 def run_dense_gemm(
@@ -736,18 +756,6 @@ def run_dense_gemm(
         )
         return testing.JitArguments(a_tensor, b_tensor, c_tensor, current_stream)
 
-    @lru_cache(maxsize=1)
-    def compile_mm(
-        a: cute.Tensor,
-        b: cute.Tensor,
-        c: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr = None,
-    ):
-        from cutlass.cute.runtime import make_fake_stream
-
-        stream = make_fake_stream()
-        return cute.compile(host_function, a, b, c, max_active_clusters, stream)
-
     a_tensor, b_tensor, c_tensor, a_torch_cpu, b_torch_cpu, c_torch_cpu, c_torch_gpu = (
         create_tensors(l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype)
     )
@@ -760,7 +768,14 @@ def run_dense_gemm(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
 
-    compiled_gemm = compile_mm(a_tensor, b_tensor, c_tensor, max_active_clusters)
+    compiled_gemm = cutez.compile(
+        host_function,
+        a_tensor,
+        b_tensor,
+        c_tensor,
+        max_active_clusters,
+        current_stream,
+    )
 
     def compare(a_torch_cpu, b_torch_cpu, c_torch_gpu, c_dtype, tolerance):
         import torch
