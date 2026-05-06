@@ -67,6 +67,13 @@ def test_compile_forwards_to_cutlass_cute_compile(cutez_module, monkeypatch):
     assert calls == [((kernel, arg1, arg2), {"stream": "stream0"})]
 
 
+def test_public_autotune_api_has_explicit_stable_exports(cutez_module):
+    assert cutez_module.__all__ == ["Config", "autotune", "compile"]
+    assert cutez_module.Config is importlib.import_module("cutez.autotune").Config
+    assert cutez_module.autotune is importlib.import_module("cutez.autotune").autotune
+    assert cutez_module.compile is importlib.import_module("cutez.compiler").compile
+
+
 def test_compile_reads_decorated_call_metadata_before_delegating(
     cutez_module, monkeypatch
 ):

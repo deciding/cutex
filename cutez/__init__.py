@@ -53,6 +53,8 @@ from torch._prims_common import number_type
 from .autotune import Config, autotune
 from .compiler import compile
 
+__all__ = ["Config", "autotune", "compile"]
+
 
 @dsl_user_op
 def get_smem_store_op(
