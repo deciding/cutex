@@ -102,7 +102,10 @@ def test_compile_reads_decorated_call_metadata_before_delegating(
     assert read_calls[0][0] is kernel
     assert read_calls[0][1] is not None
     assert read_calls[0][1].key == ("m",)
-    assert calls == [((kernel, "arg0"), {"stream": "stream0"})]
+    assert len(calls) == 1
+    assert calls[0][0][0].tile == 64
+    assert calls[0][0][1:] == ("arg0",)
+    assert calls[0][1] == {"stream": "stream0"}
 
 
 def test_compile_reads_decorated_function_metadata_before_delegating(
@@ -149,7 +152,10 @@ def test_compile_reads_decorated_function_metadata_before_delegating(
     assert read_calls[0][0] is kernel
     assert read_calls[0][1] is not None
     assert read_calls[0][1].key == ("n",)
-    assert calls == [((kernel, "arg0"), {"stream": "stream0"})]
+    assert len(calls) == 1
+    assert calls[0][0][0].tile == 32
+    assert calls[0][0][1:] == ("arg0",)
+    assert calls[0][1] == {"stream": "stream0"}
 
 
 def test_compile_requires_autotune_init_kwargs_for_decorated_kernels(
@@ -189,3 +195,58 @@ def test_compile_prefers_explicit_autotune_key_values_over_defaults(
     values = resolve_autotune_key_values(Kernel(), "arg0", stream="stream0")
 
     assert values == {"m": 7, "n": 2, "extra": 9}
+
+
+def test_compile_compiles_and_benchmarks_every_config_and_returns_fastest_candidate(
+    cutez_module, monkeypatch
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    compile_calls = []
+    benchmark_calls = []
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append((candidate_kernel, args, kwargs))
+        return f"compiled:{candidate_kernel.mma_tiler_mn}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append((compiled_kernel, args, kwargs))
+        return {"compiled:(128, 256)": 2.0, "compiled:(256, 256)": 1.0}[compiled_kernel]
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+
+    class Kernel:
+        def __init__(self, mma_tiler_mn):
+            self.mma_tiler_mn = mma_tiler_mn
+
+        def autotune_init_kwargs(self):
+            return {"mma_tiler_mn": self.mma_tiler_mn}
+
+        def autotune_key_values(self, *args, **kwargs):
+            return {"m": 1}
+
+        @cutez_module.autotune(
+            configs=[
+                cutez_module.Config(kwargs={"mma_tiler_mn": (128, 256)}),
+                cutez_module.Config(kwargs={"mma_tiler_mn": (256, 256)}),
+            ],
+            key=["m"],
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    result = cutez_module.compile(Kernel((64, 64)), "arg0", stream="stream0")
+
+    assert result == "compiled:(256, 256)"
+    assert [call[0].mma_tiler_mn for call in compile_calls] == [(128, 256), (256, 256)]
+    assert [call[0] for call in benchmark_calls] == [
+        "compiled:(128, 256)",
+        "compiled:(256, 256)",
+    ]
