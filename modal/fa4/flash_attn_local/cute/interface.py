@@ -643,7 +643,7 @@ def _flash_attn_fwd(
                 ]
             )
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-            *compile_args, options="--enable-tvm-ffi --opt-level 3"
+            *compile_args, options="--enable-tvm-ffi --opt-level 3 --ptxas-options '--verbose'"
         )
 
     # In "fake mode", we will take torch fake tensors as input and the expected behaviors are:

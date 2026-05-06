@@ -22,7 +22,7 @@ fa4_image = (
         "dpkg -i cuda-keyring_1.1-1_all.deb",
         "apt-get update",
     )
-    .apt_install("cuda-toolkit-12-6")
+    .apt_install("cuda-toolkit-13-2")
     .workdir("/workspace")
 )
 
@@ -52,6 +52,59 @@ def run_fa4_benchmark(use_simple: bool = False):
     from typing import NamedTuple
     from triton.testing import do_bench
     import os
+    import subprocess
+    #result = subprocess.run(
+    #    ["find", "/", "-name", "cuobjdump"],
+    #    capture_output=True,
+    #    text=True,
+    #    check=True,
+    #)
+    #output = result.stdout
+    #print(output)
+    cuobjdump_path = "/usr/local/cuda-13.2/bin/cuobjdump"
+    from pathlib import Path
+
+    def run_cuobjdump(DUMP_DIR):
+        dump_path = Path(DUMP_DIR)
+
+        # 1. Search for the cubin file containing 'localcute'
+        files = list(dump_path.glob("*localcute*.cubin"))
+
+        if not files:
+            print(f"Error: No .cubin file with 'localcute' found in {DUMP_DIR}")
+            return
+
+        target_file = files[0]
+        log_file = dump_path / "cuobjdump.log"
+
+        print(f"Processing: {target_file.name}...")
+
+        try:
+            # 2. Run cuobjdump -res-usage to check for LMEM/Register stats
+            # -res-usage is the most direct way to see if 'LMEM' > 0
+            result = subprocess.run(
+                #[cuobjdump_path, "-res-usage", str(target_file)],
+                [cuobjdump_path, "--dump-sass", str(target_file)],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            # 3. Write output to log file
+            with open(log_file, "w") as f:
+                f.write(result.stdout)
+
+            print(f"Success! Output written to: {log_file}")
+
+            # Quick check for spills in the console
+            if "LMEM" in result.stdout:
+                print("\nQuick Summary:")
+                print(result.stdout.strip())
+
+        except subprocess.CalledProcessError as e:
+            print(f"Command failed. Error output:\n{e.stderr}")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
 
     from datetime import datetime
 
@@ -67,6 +120,7 @@ def run_fa4_benchmark(use_simple: bool = False):
     os.makedirs(DUMP_DIR, exist_ok=True)
     os.environ["CUTE_DSL_DUMP_DIR"] = DUMP_DIR
     os.environ["CUTE_DSL_KEEP_PTX"] = "1"
+    os.environ["CUTE_DSL_KEEP_CUBIN"] = "1"
     os.environ["CUTE_DSL_LINEINFO"] = "1"
 
     class Timing(NamedTuple):
@@ -459,6 +513,16 @@ def run_fa4_benchmark(use_simple: bool = False):
 
     print(f"\nResults saved to {results_file}")
 
+    run_cuobjdump(DUMP_DIR)
+
+    #result = subprocess.run(
+    #    ["find", "/", "-name", "cuobjdump"],
+    #    capture_output=True,
+    #    text=True,
+    #    check=True,
+    #)
+    #output = result.stdout
+    #print(output)
     # Generate HTML viewers for PTX files
     from teraxlang.tools import generate_htmls
 
@@ -471,5 +535,5 @@ def run_fa4_benchmark(use_simple: bool = False):
 
 
 @app.local_entrypoint()
-def main(use_simple: bool = True):
+def main(use_simple: bool = False):
     run_fa4_benchmark.remote(use_simple=use_simple)
