@@ -1,3 +1,5 @@
+import inspect
+
 import cutlass.cute as cute
 
 from .autotune import (
@@ -13,6 +15,12 @@ from .benchmark import benchmark
 
 _COMPILE_CACHE = {}
 _BEST_CONFIG_CACHE = {}
+
+
+def _kernel_identity(kernel):
+    if inspect.isfunction(kernel):
+        return kernel
+    return type(kernel)
 
 
 def _config_label(config):
@@ -36,7 +44,10 @@ def _tuning_key(kernel, spec, runtime_key_values):
             f"missing autotune key field '{missing_name}' in resolved key values; "
             f"available keys: {available_keys}"
         )
-    return (type(kernel), tuple(runtime_key_values[name] for name in spec.key))
+    return (
+        _kernel_identity(kernel),
+        tuple(runtime_key_values[name] for name in spec.key),
+    )
 
 
 def _candidate_kwargs(kernel, runtime_key_values, config):
@@ -54,7 +65,7 @@ def _compile_signature(args, kwargs):
 
 def _compile_cache_key(kernel, candidate_kwargs, config, args, kwargs):
     return (
-        type(kernel),
+        _kernel_identity(kernel),
         config_identity(config),
         freeze_for_cache(candidate_kwargs),
         _compile_signature(args, kwargs),
@@ -73,12 +84,16 @@ def _compile_candidate(candidate_kernel, cache_key, args, kwargs):
 
 
 def _reconstruct_candidate(kernel, candidate_kwargs):
+    if inspect.isfunction(kernel):
+        return kernel(**candidate_kwargs)
     return type(kernel)(**candidate_kwargs)
 
 
 def compile(kernel, *args, **kwargs):
     spec = read_autotune_spec(kernel)
-    if autotune_spec_applies_to_call(kernel, spec):
+    if spec is not None and (
+        inspect.isfunction(kernel) or autotune_spec_applies_to_call(kernel, spec)
+    ):
         if not hasattr(kernel, "autotune_init_kwargs"):
             raise AttributeError("autotuned kernel must define autotune_init_kwargs()")
         runtime_key_values = resolve_autotune_key_values(kernel, *args, **kwargs)

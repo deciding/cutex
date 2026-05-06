@@ -224,6 +224,49 @@ def test_compile_prefers_explicit_autotune_key_values_over_defaults(
     assert values == {"m": 7, "n": 2, "extra": 9}
 
 
+def test_compile_autotunes_decorated_plain_host_functions(cutez_module, monkeypatch):
+    compiler_module = importlib.import_module("cutez.compiler")
+    compile_calls = []
+    benchmark_calls = []
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append((candidate_kernel, args, kwargs))
+        return f"compiled:{candidate_kernel.kwargs['tile']}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append((compiled_kernel, args, kwargs))
+        return {"compiled:16": 2.0, "compiled:32": 1.0}[compiled_kernel]
+
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+
+    class HostKernel:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    @cutez_module.autotune(
+        configs=[
+            cutez_module.Config(kwargs={"tile": 16}),
+            cutez_module.Config(kwargs={"tile": 32}),
+        ],
+        key=["m"],
+    )
+    def host_function(m, tile):
+        return HostKernel(m=m, tile=tile)
+
+    host_function.autotune_init_kwargs = lambda: {"m": 0, "tile": 0}
+    host_function.autotune_key_values = lambda *args, **kwargs: {"m": 7}
+
+    result = cutez_module.compile(host_function, "arg0", stream="stream0")
+
+    assert result == "compiled:32"
+    assert [call[0].kwargs for call in compile_calls] == [
+        {"m": 7, "tile": 16},
+        {"m": 7, "tile": 32},
+    ]
+    assert [call[0] for call in benchmark_calls] == ["compiled:16", "compiled:32"]
+
+
 def test_compile_compiles_and_benchmarks_every_config_and_returns_fastest_candidate(
     cutez_module, monkeypatch
 ):
