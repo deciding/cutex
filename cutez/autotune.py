@@ -45,6 +45,10 @@ def autotune(
 
 
 def read_autotune_spec(kernel) -> AutotuneSpec | None:
+    spec = getattr(kernel, "__cutez_autotune__", None)
+    if spec is not None:
+        return spec
+
     call = getattr(kernel, "__call__", None)
     return getattr(call, "__cutez_autotune__", None)
 

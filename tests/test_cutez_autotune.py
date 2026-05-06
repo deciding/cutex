@@ -97,3 +97,41 @@ def test_compile_reads_decorated_call_metadata_before_delegating(
     assert read_calls[0][1] is not None
     assert read_calls[0][1].key == ("m",)
     assert calls == [((kernel, "arg0"), {"stream": "stream0"})]
+
+
+def test_compile_reads_decorated_function_metadata_before_delegating(
+    cutez_module, monkeypatch
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    calls = []
+    read_calls = []
+
+    def fake_read_autotune_spec(kernel):
+        spec = autotune_module.get_autotune_spec(kernel)
+        read_calls.append((kernel, spec))
+        return spec
+
+    def fake_compile(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "compiled"
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+
+    @cutez_module.autotune(
+        configs=[cutez_module.Config(kwargs={"tile": 32})], key=["n"]
+    )
+    def kernel(*args, **kwargs):
+        return args, kwargs
+
+    result = cutez_module.compile(kernel, "arg0", stream="stream0")
+
+    assert result == "compiled"
+    assert len(read_calls) == 1
+    assert read_calls[0][0] is kernel
+    assert read_calls[0][1] is not None
+    assert read_calls[0][1].key == ("n",)
+    assert calls == [((kernel, "arg0"), {"stream": "stream0"})]
