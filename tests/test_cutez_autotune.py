@@ -81,6 +81,12 @@ def test_compile_reads_decorated_call_metadata_before_delegating(
     monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
 
     class Kernel:
+        def autotune_init_kwargs(self):
+            return {"m": 1}
+
+        def autotune_key_values(self, *args, **kwargs):
+            return {"m": 1}
+
         @cutez_module.autotune(
             configs=[cutez_module.Config(kwargs={"tile": 64})], key=["m"]
         )
@@ -121,12 +127,20 @@ def test_compile_reads_decorated_function_metadata_before_delegating(
     )
     monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
 
-    @cutez_module.autotune(
-        configs=[cutez_module.Config(kwargs={"tile": 32})], key=["n"]
-    )
-    def kernel(*args, **kwargs):
-        return args, kwargs
+    class Kernel:
+        def autotune_init_kwargs(self):
+            return {"n": 2}
 
+        def autotune_key_values(self, *args, **kwargs):
+            return {"n": 2}
+
+        @cutez_module.autotune(
+            configs=[cutez_module.Config(kwargs={"tile": 32})], key=["n"]
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    kernel = Kernel()
     result = cutez_module.compile(kernel, "arg0", stream="stream0")
 
     assert result == "compiled"
@@ -135,3 +149,42 @@ def test_compile_reads_decorated_function_metadata_before_delegating(
     assert read_calls[0][1] is not None
     assert read_calls[0][1].key == ("n",)
     assert calls == [((kernel, "arg0"), {"stream": "stream0"})]
+
+
+def test_compile_requires_autotune_init_kwargs_for_decorated_kernels(
+    cutez_module, monkeypatch
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    monkeypatch.setattr(
+        compiler_module.cute, "compile", lambda *args, **kwargs: "compiled"
+    )
+
+    class Kernel:
+        def autotune_key_values(self, *args, **kwargs):
+            return {"m": 1}
+
+        @cutez_module.autotune(
+            configs=[cutez_module.Config(kwargs={"tile": 16})], key=["m"]
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    with pytest.raises(AttributeError, match="autotune_init_kwargs"):
+        cutez_module.compile(Kernel(), "arg0", stream="stream0")
+
+
+def test_compile_prefers_explicit_autotune_key_values_over_defaults(
+    cutez_module, monkeypatch
+):
+    from cutez._autotune_keys import resolve_autotune_key_values
+
+    class Kernel:
+        def autotune_init_kwargs(self):
+            return {"m": 1, "n": 2}
+
+        def autotune_key_values(self, *args, **kwargs):
+            return {"m": 7, "extra": 9}
+
+    values = resolve_autotune_key_values(Kernel(), "arg0", stream="stream0")
+
+    assert values == {"m": 7, "n": 2, "extra": 9}
