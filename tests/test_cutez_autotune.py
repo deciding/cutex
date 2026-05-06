@@ -393,3 +393,120 @@ def test_compile_raises_when_candidate_constructor_rejects_config(
 
     with pytest.raises(TypeError):
         cutez_module.compile(Kernel(), "arg0", stream="stream0")
+
+
+def test_compile_caches_best_config_by_tuning_key(cutez_module, monkeypatch):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    compile_calls = []
+    benchmark_calls = []
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append(candidate_kernel.tile)
+        return f"compiled:{candidate_kernel.tile}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append(compiled_kernel)
+        return {"compiled:16": 2.0, "compiled:32": 1.0}[compiled_kernel]
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+
+    class Kernel:
+        def __init__(self, m, tile):
+            self.m = m
+            self.tile = tile
+
+        def autotune_init_kwargs(self):
+            return {"m": self.m, "tile": self.tile}
+
+        def autotune_key_values(self, *args, **kwargs):
+            return {"m": self.m}
+
+        @cutez_module.autotune(
+            configs=[
+                cutez_module.Config(kwargs={"tile": 16}),
+                cutez_module.Config(kwargs={"tile": 32}),
+            ],
+            key=["m"],
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    kernel = Kernel(7, 0)
+
+    first = cutez_module.compile(kernel, "arg0", stream="stream0")
+    second = cutez_module.compile(kernel, "arg0", stream="stream0")
+
+    assert first == "compiled:32"
+    assert second == "compiled:32"
+    assert compile_calls == [16, 32]
+    assert benchmark_calls == ["compiled:16", "compiled:32"]
+
+
+def test_compile_reuses_compiled_candidates_across_tuning_keys(
+    cutez_module, monkeypatch
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    compile_calls = []
+    benchmark_calls = []
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append((candidate_kernel.m, candidate_kernel.tile))
+        return f"compiled:{candidate_kernel.tile}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append(compiled_kernel)
+        return {"compiled:16": 2.0, "compiled:32": 1.0}[compiled_kernel]
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+
+    class Kernel:
+        def __init__(self, m, tile):
+            self.m = m
+            self.tile = tile
+
+        def autotune_init_kwargs(self):
+            return {"m": self.m, "tile": self.tile}
+
+        def autotune_key_values(self, arg0, **kwargs):
+            return {"problem_id": arg0}
+
+        @cutez_module.autotune(
+            configs=[
+                cutez_module.Config(kwargs={"tile": 16}),
+                cutez_module.Config(kwargs={"tile": 32}),
+            ],
+            key=["problem_id"],
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    kernel = Kernel(0, 0)
+
+    first = cutez_module.compile(kernel, 7, stream="stream0")
+    second = cutez_module.compile(kernel, 9, stream="stream0")
+
+    assert first == "compiled:32"
+    assert second == "compiled:32"
+    assert compile_calls == [(0, 16), (0, 32)]
+    assert benchmark_calls == [
+        "compiled:16",
+        "compiled:32",
+        "compiled:16",
+        "compiled:32",
+    ]

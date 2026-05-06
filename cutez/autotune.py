@@ -62,3 +62,7 @@ def autotune_spec_applies_to_call(kernel, spec: AutotuneSpec | None) -> bool:
 
 def get_autotune_spec(kernel) -> AutotuneSpec | None:
     return read_autotune_spec(kernel)
+
+
+def config_identity(config: Config) -> tuple[tuple[str, Any], ...]:
+    return tuple(sorted(config.kwargs.items()))
