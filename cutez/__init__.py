@@ -50,10 +50,9 @@ from cutlass.cutlass_dsl import (
 )
 from torch._prims_common import number_type
 
+# Public autotune entrypoints live alongside the broader cutez package exports.
 from .autotune import Config, autotune
 from .compiler import compile
-
-__all__ = ["Config", "autotune", "compile"]
 
 
 @dsl_user_op
