@@ -16,6 +16,7 @@ def cutez_module(monkeypatch):
 
 
 def test_autotune_decorator_stores_normalized_metadata(cutez_module):
+    autotune_module = importlib.import_module("cutez.autotune")
     pre_hook = object()
     config = cutez_module.Config(kwargs={"tile": 128}, name="fast", pre_hook=pre_hook)
 
@@ -24,7 +25,7 @@ def test_autotune_decorator_stores_normalized_metadata(cutez_module):
         def __call__(self, *args, **kwargs):
             return args, kwargs
 
-    spec = Kernel().__call__.__cutez_autotune__
+    spec = autotune_module.get_autotune_spec(Kernel())
 
     assert spec.configs == (config,)
     assert spec.key == ("m", "n")
@@ -57,33 +58,22 @@ def test_compile_forwards_to_cutlass_cute_compile(cutez_module, monkeypatch):
     assert calls == [((kernel, arg1, arg2), {"stream": "stream0"})]
 
 
-def test_compile_inspects_call_metadata_before_delegating(cutez_module, monkeypatch):
-    compiler_module = importlib.import_module("cutez.compiler")
-    calls = []
-
-    def fake_compile(*args, **kwargs):
-        calls.append((args, kwargs))
-        return "compiled"
-
-    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+def test_get_autotune_spec_reads_decorated_call_metadata(cutez_module):
+    autotune_module = importlib.import_module("cutez.autotune")
+    config = cutez_module.Config(kwargs={"tile": 64})
 
     class Kernel:
-        def __init__(self):
-            self.call_lookups = 0
-
-        def __getattribute__(self, name):
-            if name == "__call__":
-                object.__getattribute__(self, "__dict__")["call_lookups"] += 1
-            return object.__getattribute__(self, name)
-
-        @cutez_module.autotune(configs=[cutez_module.Config()], key=["m"])
+        @cutez_module.autotune(configs=[config], key=["m"])
         def __call__(self, *args, **kwargs):
             return args, kwargs
 
-    kernel = Kernel()
+    class PlainKernel:
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
 
-    result = cutez_module.compile(kernel, "arg0", stream="stream0")
+    spec = autotune_module.get_autotune_spec(Kernel())
 
-    assert result == "compiled"
-    assert kernel.call_lookups == 1
-    assert calls == [((kernel, "arg0"), {"stream": "stream0"})]
+    assert spec is not None
+    assert spec.configs == (config,)
+    assert spec.key == ("m",)
+    assert autotune_module.get_autotune_spec(PlainKernel()) is None

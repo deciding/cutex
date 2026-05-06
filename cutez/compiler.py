@@ -1,6 +1,8 @@
 import cutlass.cute as cute
 
+from .autotune import get_autotune_spec
+
 
 def compile(kernel, *args, **kwargs):
-    getattr(getattr(kernel, "__call__", None), "__cutez_autotune__", None)
+    get_autotune_spec(kernel)
     return cute.compile(kernel, *args, **kwargs)
