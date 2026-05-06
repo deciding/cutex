@@ -479,12 +479,13 @@ def test_compile_reuses_compiled_candidates_across_tuning_keys(
         def __init__(self, m, tile):
             self.m = m
             self.tile = tile
+            self.problem_id = 7
 
         def autotune_init_kwargs(self):
             return {"m": self.m, "tile": self.tile}
 
         def autotune_key_values(self, arg0, **kwargs):
-            return {"problem_id": arg0}
+            return {"problem_id": self.problem_id}
 
         @cutez_module.autotune(
             configs=[
@@ -498,8 +499,9 @@ def test_compile_reuses_compiled_candidates_across_tuning_keys(
 
     kernel = Kernel(0, 0)
 
-    first = cutez_module.compile(kernel, 7, stream="stream0")
-    second = cutez_module.compile(kernel, 9, stream="stream0")
+    first = cutez_module.compile(kernel, "shape", stream="stream0")
+    kernel.problem_id = 9
+    second = cutez_module.compile(kernel, "shape", stream="stream0")
 
     assert first == "compiled:32"
     assert second == "compiled:32"
@@ -510,3 +512,53 @@ def test_compile_reuses_compiled_candidates_across_tuning_keys(
         "compiled:16",
         "compiled:32",
     ]
+
+
+def test_compile_cache_distinguishes_positional_compile_inputs(
+    cutez_module, monkeypatch
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    compile_calls = []
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append((candidate_kernel.tile, args[0]))
+        return f"compiled:{candidate_kernel.tile}:{args[0]}"
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(
+        compiler_module, "benchmark", lambda compiled, *a, **k: 0.0, raising=False
+    )
+
+    class Kernel:
+        def __init__(self, tile):
+            self.tile = tile
+
+        def autotune_init_kwargs(self):
+            return {"tile": self.tile}
+
+        def autotune_key_values(self, problem_id, **kwargs):
+            return {"problem_id": problem_id}
+
+        @cutez_module.autotune(
+            configs=[cutez_module.Config(kwargs={"tile": 16})],
+            key=["problem_id"],
+            cache_results=False,
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    kernel = Kernel(0)
+
+    first = cutez_module.compile(kernel, "shape_a", stream="stream0")
+    second = cutez_module.compile(kernel, "shape_b", stream="stream0")
+
+    assert first == "compiled:16:shape_a"
+    assert second == "compiled:16:shape_b"
+    assert compile_calls == [(16, "shape_a"), (16, "shape_b")]

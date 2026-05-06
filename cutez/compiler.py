@@ -36,8 +36,8 @@ def _candidate_kwargs(kernel, runtime_key_values, config):
     return candidate_kwargs
 
 
-def _compile_signature(kwargs):
-    return _freeze_value(kwargs)
+def _compile_signature(args, kwargs):
+    return (_freeze_value(args), _freeze_value(kwargs))
 
 
 def _compile_cache_key(kernel, candidate_kwargs, config, args, kwargs):
@@ -45,7 +45,7 @@ def _compile_cache_key(kernel, candidate_kwargs, config, args, kwargs):
         type(kernel),
         config_identity(config),
         _freeze_value(candidate_kwargs),
-        _compile_signature(kwargs),
+        _compile_signature(args, kwargs),
     )
 
 
