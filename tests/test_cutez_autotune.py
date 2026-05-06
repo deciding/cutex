@@ -5,6 +5,10 @@ import sys
 import pytest
 
 
+class Constexpr:
+    pass
+
+
 @pytest.fixture
 def cutez_module(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
@@ -353,6 +357,51 @@ def test_compile_passes_runtime_args_and_autotune_kwargs_for_plain_host_function
         {"stream": "stream0", "m": 5, "tile": 32},
     ]
     assert [call[0] for call in benchmark_calls] == ["compiled:16", "compiled:32"]
+
+
+def test_compile_benchmarks_plain_host_functions_without_constexpr_positional_args(
+    cutez_module, monkeypatch
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    compile_calls = []
+    benchmark_calls = []
+
+    def compiled_runtime(a, b, stream):
+        return (a, b, stream)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append((candidate_kernel, args, kwargs))
+        return compiled_runtime
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append((compiled_kernel, args, kwargs))
+        return 1.0
+
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+
+    @cutez_module.autotune(
+        configs=[cutez_module.Config(kwargs={"tile": 32})],
+        key=["m"],
+    )
+    def host_function(a, b, compile_only: Constexpr, stream, m, tile):
+        return (a, b, compile_only, stream, m, tile)
+
+    host_function.autotune_init_kwargs = lambda: {"m": 0, "tile": 0}
+    host_function.autotune_key_values = lambda a, b, *args, **kwargs: {
+        "m": len(a) + len(b)
+    }
+
+    result = cutez_module.compile(host_function, "aa", "bbb", True, stream="stream0")
+
+    assert callable(result)
+    assert [call[1] for call in compile_calls] == [("aa", "bbb", True)]
+    assert [call[2] for call in compile_calls] == [
+        {"stream": "stream0", "m": 5, "tile": 32}
+    ]
+    assert len(benchmark_calls) == 1
+    assert benchmark_calls[0][1] == ("aa", "bbb")
+    assert benchmark_calls[0][2] == {"stream": "stream0", "warmup": 0, "rep": 0}
 
 
 def test_compile_isolates_plain_function_caches_by_function_identity(

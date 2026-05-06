@@ -95,6 +95,29 @@ def _compile_target_and_kwargs(kernel, candidate_kwargs, kwargs):
     return _reconstruct_candidate(kernel, candidate_kwargs), kwargs
 
 
+def _benchmark_args_and_kwargs(kernel, compiled, args, kwargs):
+    if not inspect.isfunction(kernel) or not callable(compiled):
+        return args, kwargs
+
+    kernel_signature = inspect.signature(kernel)
+    runtime_args = []
+    arg_index = 0
+    for param in kernel_signature.parameters.values():
+        if param.kind not in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
+            continue
+        if arg_index >= len(args):
+            break
+        annotation_name = getattr(param.annotation, "__name__", None)
+        if annotation_name == "Constexpr":
+            arg_index += 1
+            continue
+        if param.name in kernel.autotune_init_kwargs():
+            continue
+        runtime_args.append(args[arg_index])
+        arg_index += 1
+    return tuple(runtime_args), kwargs
+
+
 def compile(kernel, *args, **kwargs):
     spec = read_autotune_spec(kernel)
     if spec is not None and (
@@ -154,8 +177,15 @@ def compile(kernel, *args, **kwargs):
                     failures.append((_config_label(config), exc))
                     continue
             try:
+                bench_args, bench_kwargs = _benchmark_args_and_kwargs(
+                    kernel, compiled, args, kwargs
+                )
                 timed = do_bench(
-                    compiled, *args, warmup=spec.warmup, rep=spec.rep, **kwargs
+                    compiled,
+                    *bench_args,
+                    warmup=spec.warmup,
+                    rep=spec.rep,
+                    **bench_kwargs,
                 )
             except Exception as exc:
                 failures.append((_config_label(config), exc))

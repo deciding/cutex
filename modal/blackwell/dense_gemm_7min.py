@@ -61,7 +61,7 @@ cluster_shape_mn = (2, 1)
 
 AUTOTUNE_CONFIGS = [
     cutez.Config(kwargs={"mma_tiler_mn": (256, 256), "cluster_shape_mn": (2, 1)}),
-    cutez.Config(kwargs={"mma_tiler_mn": (128, 256), "cluster_shape_mn": (1, 1)}),
+    cutez.Config(kwargs={"mma_tiler_mn": (128, 256), "cluster_shape_mn": (2, 1)}),
 ]
 
 
@@ -513,9 +513,10 @@ def host_function(
     a: cute.Tensor,
     b: cute.Tensor,
     c: cute.Tensor,
+    max_active_clusters: cutlass.Constexpr,
     stream: cuda.CUstream,
-    mma_tiler_mn,
-    cluster_shape_mn,
+    mma_tiler_mn: cutlass.Constexpr,
+    cluster_shape_mn: cutlass.Constexpr,
 ):
     mma_tiler_mnk = (*mma_tiler_mn, mma_tile_k)
 
@@ -601,9 +602,6 @@ def host_function(
 
     # tile scheduler
 
-    max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1]
-    )
     cluster_shape_mnl = (*cluster_shape_mn, 1)
     cta_tile_shape_mnk = (
         mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id.shape),
@@ -765,12 +763,16 @@ def run_dense_gemm(
     torch_stream = torch.cuda.current_stream()
 
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
+    max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
+        cluster_shape_mn[0] * cluster_shape_mn[1]
+    )
 
     compiled_gemm = cutez.compile(
         host_function,
         a_tensor,
         b_tensor,
         c_tensor,
+        max_active_clusters,
         current_stream,
     )
 
