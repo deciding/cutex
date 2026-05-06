@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import inspect
 from typing import Any, Callable, Mapping
 
 
@@ -51,6 +52,12 @@ def read_autotune_spec(kernel) -> AutotuneSpec | None:
 
     call = getattr(kernel, "__call__", None)
     return getattr(call, "__cutez_autotune__", None)
+
+
+def autotune_spec_applies_to_call(kernel, spec: AutotuneSpec | None) -> bool:
+    if spec is None:
+        return False
+    return not inspect.isfunction(kernel)
 
 
 def get_autotune_spec(kernel) -> AutotuneSpec | None:

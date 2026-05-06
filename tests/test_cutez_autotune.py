@@ -141,6 +141,7 @@ def test_compile_reads_decorated_function_metadata_before_delegating(
             return args, kwargs
 
     kernel = Kernel()
+
     result = cutez_module.compile(kernel, "arg0", stream="stream0")
 
     assert result == "compiled"
