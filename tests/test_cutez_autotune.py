@@ -562,3 +562,122 @@ def test_compile_cache_distinguishes_positional_compile_inputs(
     assert first == "compiled:16:shape_a"
     assert second == "compiled:16:shape_b"
     assert compile_calls == [(16, "shape_a"), (16, "shape_b")]
+
+
+def test_compile_cache_distinguishes_configs_with_different_pre_hooks(
+    cutez_module, monkeypatch
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    compile_calls = []
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append(candidate_kernel.marker)
+        return f"compiled:{candidate_kernel.marker}"
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(
+        compiler_module, "benchmark", lambda compiled, *a, **k: 0.0, raising=False
+    )
+
+    class Kernel:
+        def __init__(self, tile, marker="base"):
+            self.tile = tile
+            self.marker = marker
+
+        def autotune_init_kwargs(self):
+            return {"tile": self.tile, "marker": self.marker}
+
+        def autotune_key_values(self, problem_id, **kwargs):
+            return {"problem_id": problem_id}
+
+        @cutez_module.autotune(
+            configs=[
+                cutez_module.Config(
+                    kwargs={"tile": 16},
+                    pre_hook=lambda candidate, *a, **k: setattr(
+                        candidate, "marker", "hook_a"
+                    ),
+                ),
+                cutez_module.Config(
+                    kwargs={"tile": 16},
+                    pre_hook=lambda candidate, *a, **k: setattr(
+                        candidate, "marker", "hook_b"
+                    ),
+                ),
+            ],
+            key=["problem_id"],
+            cache_results=False,
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    kernel = Kernel(0)
+
+    first = cutez_module.compile(kernel, "shape_a", stream="stream0")
+    second = cutez_module.compile(kernel, "shape_b", stream="stream0")
+
+    assert first == "compiled:hook_a"
+    assert second == "compiled:hook_a"
+    assert compile_calls == ["hook_a", "hook_b", "hook_a", "hook_b"]
+
+
+def test_compile_cache_accepts_unhashable_positional_inputs(cutez_module, monkeypatch):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    compile_calls = []
+
+    class ShapeArg:
+        __hash__ = None
+
+        def __init__(self, label):
+            self.label = label
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append((candidate_kernel.tile, args[0].label))
+        return f"compiled:{candidate_kernel.tile}:{args[0].label}"
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(
+        compiler_module, "benchmark", lambda compiled, *a, **k: 0.0, raising=False
+    )
+
+    class Kernel:
+        def __init__(self, tile, shape_meta=None):
+            self.tile = tile
+            self.shape_meta = shape_meta or {"sizes": [1, 2]}
+
+        def autotune_init_kwargs(self):
+            return {"tile": self.tile, "shape_meta": self.shape_meta}
+
+        def autotune_key_values(self, problem_id, **kwargs):
+            return {"problem_id": problem_id.label}
+
+        @cutez_module.autotune(
+            configs=[cutez_module.Config(kwargs={"tile": 16})],
+            key=["problem_id"],
+            cache_results=False,
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    kernel = Kernel(0)
+
+    first = cutez_module.compile(kernel, ShapeArg("shape_a"), stream="stream0")
+    second = cutez_module.compile(kernel, ShapeArg("shape_b"), stream="stream0")
+
+    assert first == "compiled:16:shape_a"
+    assert second == "compiled:16:shape_b"
+    assert compile_calls == [(16, "shape_a"), (16, "shape_b")]

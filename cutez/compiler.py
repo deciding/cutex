@@ -3,6 +3,7 @@ import cutlass.cute as cute
 from .autotune import (
     autotune_spec_applies_to_call,
     config_identity,
+    freeze_for_cache,
     read_autotune_spec,
 )
 from ._autotune_keys import resolve_autotune_key_values
@@ -11,16 +12,6 @@ from .benchmark import benchmark
 
 _COMPILE_CACHE = {}
 _BEST_CONFIG_CACHE = {}
-
-
-def _freeze_value(value):
-    if isinstance(value, dict):
-        return tuple(sorted((k, _freeze_value(v)) for k, v in value.items()))
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_value(item) for item in value)
-    if isinstance(value, set):
-        return tuple(sorted(_freeze_value(item) for item in value))
-    return value
 
 
 def _tuning_key(kernel, spec, runtime_key_values):
@@ -37,14 +28,14 @@ def _candidate_kwargs(kernel, runtime_key_values, config):
 
 
 def _compile_signature(args, kwargs):
-    return (_freeze_value(args), _freeze_value(kwargs))
+    return (freeze_for_cache(args), freeze_for_cache(kwargs))
 
 
 def _compile_cache_key(kernel, candidate_kwargs, config, args, kwargs):
     return (
         type(kernel),
         config_identity(config),
-        _freeze_value(candidate_kwargs),
+        freeze_for_cache(candidate_kwargs),
         _compile_signature(args, kwargs),
     )
 

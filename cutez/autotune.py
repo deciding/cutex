@@ -65,4 +65,35 @@ def get_autotune_spec(kernel) -> AutotuneSpec | None:
 
 
 def config_identity(config: Config) -> tuple[tuple[str, Any], ...]:
-    return tuple(sorted(config.kwargs.items()))
+    return (
+        ("kwargs", freeze_for_cache(config.kwargs)),
+        ("name", freeze_for_cache(config.name)),
+        ("pre_hook", freeze_for_cache(config.pre_hook)),
+    )
+
+
+def freeze_for_cache(value):
+    if isinstance(value, dict):
+        return tuple(
+            sorted((freeze_for_cache(k), freeze_for_cache(v)) for k, v in value.items())
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze_for_cache(item) for item in value)
+    if isinstance(value, set):
+        return tuple(sorted(freeze_for_cache(item) for item in value))
+    try:
+        hash(value)
+    except TypeError:
+        attrs = getattr(value, "__dict__", None)
+        if attrs is not None:
+            return (
+                type(value),
+                tuple(
+                    sorted(
+                        (freeze_for_cache(k), freeze_for_cache(v))
+                        for k, v in attrs.items()
+                    )
+                ),
+            )
+        return (type(value), repr(value))
+    return value
