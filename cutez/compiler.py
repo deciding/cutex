@@ -1,6 +1,7 @@
 import cutlass.cute as cute
 
 from .autotune import (
+    AutotuneError,
     autotune_spec_applies_to_call,
     config_identity,
     freeze_for_cache,
@@ -12,6 +13,17 @@ from .benchmark import benchmark
 
 _COMPILE_CACHE = {}
 _BEST_CONFIG_CACHE = {}
+
+
+def _config_label(config):
+    return config.name or repr(dict(config.kwargs))
+
+
+def _format_candidate_failures(failures):
+    lines = ["all autotune candidates failed"]
+    for label, exc in failures:
+        lines.append(f"- {label}: {type(exc).__name__}: {exc}")
+    return "\n".join(lines)
 
 
 def _tuning_key(kernel, spec, runtime_key_values):
@@ -74,19 +86,27 @@ def compile(kernel, *args, **kwargs):
         best_time = None
         best_config = None
         best_candidate_kwargs = None
+        failures = []
         for config in spec.configs:
             candidate_kwargs = _candidate_kwargs(kernel, runtime_key_values, config)
-            compiled = _compile_candidate(
-                kernel, candidate_kwargs, config, args, kwargs
-            )
-            timed = do_bench(
-                compiled, *args, warmup=spec.warmup, rep=spec.rep, **kwargs
-            )
+            try:
+                compiled = _compile_candidate(
+                    kernel, candidate_kwargs, config, args, kwargs
+                )
+                timed = do_bench(
+                    compiled, *args, warmup=spec.warmup, rep=spec.rep, **kwargs
+                )
+            except Exception as exc:
+                failures.append((_config_label(config), exc))
+                continue
             if best_time is None or timed < best_time:
                 best_time = timed
                 best_compiled = compiled
                 best_config = config
                 best_candidate_kwargs = candidate_kwargs
+
+        if best_config is None:
+            raise AutotuneError(_format_candidate_failures(failures))
 
         if spec.cache_results and best_config is not None:
             _BEST_CONFIG_CACHE[tuning_key] = (best_config, best_candidate_kwargs)

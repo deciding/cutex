@@ -20,6 +20,10 @@ class AutotuneSpec:
     do_bench: Callable[..., Any] | None = None
 
 
+class AutotuneError(RuntimeError):
+    pass
+
+
 def autotune(
     *,
     configs: list[Config],
@@ -29,6 +33,9 @@ def autotune(
     cache_results: bool = True,
     do_bench: Callable[..., Any] | None = None,
 ):
+    if not configs:
+        raise ValueError("autotune requires at least one config")
+
     spec = AutotuneSpec(
         configs=tuple(configs),
         key=tuple(key),
