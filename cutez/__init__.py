@@ -50,6 +50,10 @@ from cutlass.cutlass_dsl import (
 )
 from torch._prims_common import number_type
 
+from .autotune import Config, autotune
+from .compiler import compile
+
+
 @dsl_user_op
 def get_smem_store_op(
     layout_d: LayoutEnum,
@@ -57,7 +61,7 @@ def get_smem_store_op(
     elem_ty_acc: Type[Numeric],
     tiled_tmem_load: cute.TiledCopy,
     *,
-    verbose: bool=True,
+    verbose: bool = True,
     loc=None,
     ip=None,
 ) -> cute.CopyAtom:
@@ -195,7 +199,9 @@ def get_smem_store_op(
         print("===========================================")
         print("Explain get_smem_store_op:")
         if num_dp != 16 or num_bits < 128:
-            print("NOTE: to directly use stmatrix, tcgen05.ld must have 16 lanes and 128/256b instruction")
+            print(
+                "NOTE: to directly use stmatrix, tcgen05.ld must have 16 lanes and 128/256b instruction"
+            )
         print(f"elem_ty_acc.width: {elem_ty_acc.width}")
         print(f"elem_ty_d.width: {elem_ty_d.width}")
         print(f"is_n_major: {is_n_major}")
