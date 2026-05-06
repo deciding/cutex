@@ -85,8 +85,14 @@ def _compile_candidate(candidate_kernel, cache_key, args, kwargs):
 
 def _reconstruct_candidate(kernel, candidate_kwargs):
     if inspect.isfunction(kernel):
-        return kernel(**candidate_kwargs)
+        return kernel
     return type(kernel)(**candidate_kwargs)
+
+
+def _compile_target_and_kwargs(kernel, candidate_kwargs, kwargs):
+    if inspect.isfunction(kernel):
+        return kernel, {**kwargs, **candidate_kwargs}
+    return _reconstruct_candidate(kernel, candidate_kwargs), kwargs
 
 
 def compile(kernel, *args, **kwargs):
@@ -109,10 +115,12 @@ def compile(kernel, *args, **kwargs):
             if cached_compiled is not None:
                 return cached_compiled
 
-            candidate_kernel = _reconstruct_candidate(kernel, best_candidate_kwargs)
+            candidate_kernel, compile_kwargs = _compile_target_and_kwargs(
+                kernel, best_candidate_kwargs, kwargs
+            )
             if best_config.pre_hook is not None:
                 best_config.pre_hook(candidate_kernel, *args, **kwargs)
-            return _compile_candidate(candidate_kernel, cache_key, args, kwargs)
+            return _compile_candidate(candidate_kernel, cache_key, args, compile_kwargs)
 
         best_compiled = None
         best_time = None
@@ -128,7 +136,9 @@ def compile(kernel, *args, **kwargs):
                 compiled = cached_compiled
             else:
                 try:
-                    candidate_kernel = _reconstruct_candidate(kernel, candidate_kwargs)
+                    candidate_kernel, compile_kwargs = _compile_target_and_kwargs(
+                        kernel, candidate_kwargs, kwargs
+                    )
                 except Exception as exc:
                     failures.append((_config_label(config), exc))
                     continue
@@ -138,7 +148,7 @@ def compile(kernel, *args, **kwargs):
 
                 try:
                     compiled = _compile_candidate(
-                        candidate_kernel, cache_key, args, kwargs
+                        candidate_kernel, cache_key, args, compile_kwargs
                     )
                 except Exception as exc:
                     failures.append((_config_label(config), exc))

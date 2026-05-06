@@ -338,11 +338,11 @@ def kernel(
     a_full_mcast_mask = None
     b_full_mcast_mask = None
     if cutlass.const_expr(is_a_mcast or is_b_mcast or use_2cta_instrs):
-        a_full_mcast_mask = cute.make_layout_image_mask(
-            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mode=2
+        a_full_mcast_mask = cpasync.create_tma_multicast_mask(
+            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
         )
-        b_full_mcast_mask = cute.make_layout_image_mask(
-            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mode=1
+        b_full_mcast_mask = cpasync.create_tma_multicast_mask(
+            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
         )
 
     tile_sched = utils.StaticPersistentTileScheduler.create(

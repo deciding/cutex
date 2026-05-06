@@ -231,7 +231,7 @@ def test_compile_autotunes_decorated_plain_host_functions(cutez_module, monkeypa
 
     def fake_compile(candidate_kernel, *args, **kwargs):
         compile_calls.append((candidate_kernel, args, kwargs))
-        return f"compiled:{candidate_kernel.kwargs['tile']}"
+        return f"compiled:{kwargs['tile']}"
 
     def fake_benchmark(compiled_kernel, *args, **kwargs):
         benchmark_calls.append((compiled_kernel, args, kwargs))
@@ -239,10 +239,6 @@ def test_compile_autotunes_decorated_plain_host_functions(cutez_module, monkeypa
 
     monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
     monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
-
-    class HostKernel:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
 
     @cutez_module.autotune(
         configs=[
@@ -252,7 +248,7 @@ def test_compile_autotunes_decorated_plain_host_functions(cutez_module, monkeypa
         key=["m"],
     )
     def host_function(m, tile):
-        return HostKernel(m=m, tile=tile)
+        return (m, tile)
 
     host_function.autotune_init_kwargs = lambda: {"m": 0, "tile": 0}
     host_function.autotune_key_values = lambda *args, **kwargs: {"m": 7}
@@ -260,9 +256,11 @@ def test_compile_autotunes_decorated_plain_host_functions(cutez_module, monkeypa
     result = cutez_module.compile(host_function, "arg0", stream="stream0")
 
     assert result == "compiled:32"
-    assert [call[0].kwargs for call in compile_calls] == [
-        {"m": 7, "tile": 16},
-        {"m": 7, "tile": 32},
+    assert [call[0] for call in compile_calls] == [host_function, host_function]
+    assert [call[1] for call in compile_calls] == [("arg0",), ("arg0",)]
+    assert [call[2] for call in compile_calls] == [
+        {"stream": "stream0", "m": 7, "tile": 16},
+        {"stream": "stream0", "m": 7, "tile": 32},
     ]
     assert [call[0] for call in benchmark_calls] == ["compiled:16", "compiled:32"]
 
@@ -276,7 +274,7 @@ def test_compile_reuses_cached_plain_function_candidate_on_repeated_calls(
 
     def fake_compile(candidate_kernel, *args, **kwargs):
         compile_calls.append((candidate_kernel, args, kwargs))
-        return f"compiled:{candidate_kernel.kwargs['tile']}"
+        return f"compiled:{kwargs['tile']}"
 
     def fake_benchmark(compiled_kernel, *args, **kwargs):
         benchmark_calls.append((compiled_kernel, args, kwargs))
@@ -284,10 +282,6 @@ def test_compile_reuses_cached_plain_function_candidate_on_repeated_calls(
 
     monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
     monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
-
-    class HostKernel:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
 
     @cutez_module.autotune(
         configs=[
@@ -297,7 +291,7 @@ def test_compile_reuses_cached_plain_function_candidate_on_repeated_calls(
         key=["m"],
     )
     def host_function(m, tile):
-        return HostKernel(m=m, tile=tile)
+        return (m, tile)
 
     host_function.autotune_init_kwargs = lambda: {"m": 0, "tile": 0}
     host_function.autotune_key_values = lambda *args, **kwargs: {"m": 7}
@@ -307,9 +301,56 @@ def test_compile_reuses_cached_plain_function_candidate_on_repeated_calls(
 
     assert result0 == "compiled:32"
     assert result1 == "compiled:32"
-    assert [call[0].kwargs for call in compile_calls] == [
-        {"m": 7, "tile": 16},
-        {"m": 7, "tile": 32},
+    assert [call[0] for call in compile_calls] == [host_function, host_function]
+    assert [call[1] for call in compile_calls] == [("arg0",), ("arg0",)]
+    assert [call[2] for call in compile_calls] == [
+        {"stream": "stream0", "m": 7, "tile": 16},
+        {"stream": "stream0", "m": 7, "tile": 32},
+    ]
+    assert [call[0] for call in benchmark_calls] == ["compiled:16", "compiled:32"]
+
+
+def test_compile_passes_runtime_args_and_autotune_kwargs_for_plain_host_functions(
+    cutez_module, monkeypatch
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    compile_calls = []
+    benchmark_calls = []
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append((candidate_kernel, args, kwargs))
+        return f"compiled:{kwargs['tile']}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append((compiled_kernel, args, kwargs))
+        return {"compiled:16": 2.0, "compiled:32": 1.0}[compiled_kernel]
+
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+
+    @cutez_module.autotune(
+        configs=[
+            cutez_module.Config(kwargs={"tile": 16}),
+            cutez_module.Config(kwargs={"tile": 32}),
+        ],
+        key=["m"],
+    )
+    def host_function(a, b, stream, m, tile):
+        return (a, b, stream, m, tile)
+
+    host_function.autotune_init_kwargs = lambda: {"m": 0, "tile": 0}
+    host_function.autotune_key_values = lambda a, b, *args, **kwargs: {
+        "m": len(a) + len(b)
+    }
+
+    result = cutez_module.compile(host_function, "aa", "bbb", stream="stream0")
+
+    assert result == "compiled:32"
+    assert [call[0] for call in compile_calls] == [host_function, host_function]
+    assert [call[1] for call in compile_calls] == [("aa", "bbb"), ("aa", "bbb")]
+    assert [call[2] for call in compile_calls] == [
+        {"stream": "stream0", "m": 5, "tile": 16},
+        {"stream": "stream0", "m": 5, "tile": 32},
     ]
     assert [call[0] for call in benchmark_calls] == ["compiled:16", "compiled:32"]
 
@@ -323,23 +364,19 @@ def test_compile_isolates_plain_function_caches_by_function_identity(
 
     def fake_compile(candidate_kernel, *args, **kwargs):
         compile_calls.append((candidate_kernel, args, kwargs))
-        return f"compiled:{candidate_kernel.kwargs['source']}:{candidate_kernel.kwargs['tile']}"
+        return f"compiled:{candidate_kernel.__name__}:{kwargs['tile']}"
 
     def fake_benchmark(compiled_kernel, *args, **kwargs):
         benchmark_calls.append((compiled_kernel, args, kwargs))
         return {
-            "compiled:a:16": 2.0,
-            "compiled:a:32": 1.0,
-            "compiled:b:16": 2.0,
-            "compiled:b:32": 1.0,
+            "compiled:host_function_a:16": 2.0,
+            "compiled:host_function_a:32": 1.0,
+            "compiled:host_function_b:16": 2.0,
+            "compiled:host_function_b:32": 1.0,
         }[compiled_kernel]
 
     monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
     monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
-
-    class HostKernel:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
 
     @cutez_module.autotune(
         configs=[
@@ -349,7 +386,7 @@ def test_compile_isolates_plain_function_caches_by_function_identity(
         key=["m"],
     )
     def host_function_a(m, tile):
-        return HostKernel(source="a", m=m, tile=tile)
+        return ("a", m, tile)
 
     @cutez_module.autotune(
         configs=[
@@ -359,7 +396,7 @@ def test_compile_isolates_plain_function_caches_by_function_identity(
         key=["m"],
     )
     def host_function_b(m, tile):
-        return HostKernel(source="b", m=m, tile=tile)
+        return ("b", m, tile)
 
     for host_function in (host_function_a, host_function_b):
         host_function.autotune_init_kwargs = lambda: {"m": 0, "tile": 0}
@@ -368,19 +405,25 @@ def test_compile_isolates_plain_function_caches_by_function_identity(
     result_a = cutez_module.compile(host_function_a, "arg0", stream="stream0")
     result_b = cutez_module.compile(host_function_b, "arg0", stream="stream0")
 
-    assert result_a == "compiled:a:32"
-    assert result_b == "compiled:b:32"
-    assert [call[0].kwargs for call in compile_calls] == [
-        {"source": "a", "m": 7, "tile": 16},
-        {"source": "a", "m": 7, "tile": 32},
-        {"source": "b", "m": 7, "tile": 16},
-        {"source": "b", "m": 7, "tile": 32},
+    assert result_a == "compiled:host_function_a:32"
+    assert result_b == "compiled:host_function_b:32"
+    assert [call[0] for call in compile_calls] == [
+        host_function_a,
+        host_function_a,
+        host_function_b,
+        host_function_b,
+    ]
+    assert [call[2] for call in compile_calls] == [
+        {"stream": "stream0", "m": 7, "tile": 16},
+        {"stream": "stream0", "m": 7, "tile": 32},
+        {"stream": "stream0", "m": 7, "tile": 16},
+        {"stream": "stream0", "m": 7, "tile": 32},
     ]
     assert [call[0] for call in benchmark_calls] == [
-        "compiled:a:16",
-        "compiled:a:32",
-        "compiled:b:16",
-        "compiled:b:32",
+        "compiled:host_function_a:16",
+        "compiled:host_function_a:32",
+        "compiled:host_function_b:16",
+        "compiled:host_function_b:32",
     ]
 
 
