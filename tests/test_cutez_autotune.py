@@ -267,6 +267,123 @@ def test_compile_autotunes_decorated_plain_host_functions(cutez_module, monkeypa
     assert [call[0] for call in benchmark_calls] == ["compiled:16", "compiled:32"]
 
 
+def test_compile_reuses_cached_plain_function_candidate_on_repeated_calls(
+    cutez_module, monkeypatch
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    compile_calls = []
+    benchmark_calls = []
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append((candidate_kernel, args, kwargs))
+        return f"compiled:{candidate_kernel.kwargs['tile']}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append((compiled_kernel, args, kwargs))
+        return {"compiled:16": 2.0, "compiled:32": 1.0}[compiled_kernel]
+
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+
+    class HostKernel:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    @cutez_module.autotune(
+        configs=[
+            cutez_module.Config(kwargs={"tile": 16}),
+            cutez_module.Config(kwargs={"tile": 32}),
+        ],
+        key=["m"],
+    )
+    def host_function(m, tile):
+        return HostKernel(m=m, tile=tile)
+
+    host_function.autotune_init_kwargs = lambda: {"m": 0, "tile": 0}
+    host_function.autotune_key_values = lambda *args, **kwargs: {"m": 7}
+
+    result0 = cutez_module.compile(host_function, "arg0", stream="stream0")
+    result1 = cutez_module.compile(host_function, "arg0", stream="stream0")
+
+    assert result0 == "compiled:32"
+    assert result1 == "compiled:32"
+    assert [call[0].kwargs for call in compile_calls] == [
+        {"m": 7, "tile": 16},
+        {"m": 7, "tile": 32},
+    ]
+    assert [call[0] for call in benchmark_calls] == ["compiled:16", "compiled:32"]
+
+
+def test_compile_isolates_plain_function_caches_by_function_identity(
+    cutez_module, monkeypatch
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    compile_calls = []
+    benchmark_calls = []
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append((candidate_kernel, args, kwargs))
+        return f"compiled:{candidate_kernel.kwargs['source']}:{candidate_kernel.kwargs['tile']}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append((compiled_kernel, args, kwargs))
+        return {
+            "compiled:a:16": 2.0,
+            "compiled:a:32": 1.0,
+            "compiled:b:16": 2.0,
+            "compiled:b:32": 1.0,
+        }[compiled_kernel]
+
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+
+    class HostKernel:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    @cutez_module.autotune(
+        configs=[
+            cutez_module.Config(kwargs={"tile": 16}),
+            cutez_module.Config(kwargs={"tile": 32}),
+        ],
+        key=["m"],
+    )
+    def host_function_a(m, tile):
+        return HostKernel(source="a", m=m, tile=tile)
+
+    @cutez_module.autotune(
+        configs=[
+            cutez_module.Config(kwargs={"tile": 16}),
+            cutez_module.Config(kwargs={"tile": 32}),
+        ],
+        key=["m"],
+    )
+    def host_function_b(m, tile):
+        return HostKernel(source="b", m=m, tile=tile)
+
+    for host_function in (host_function_a, host_function_b):
+        host_function.autotune_init_kwargs = lambda: {"m": 0, "tile": 0}
+        host_function.autotune_key_values = lambda *args, **kwargs: {"m": 7}
+
+    result_a = cutez_module.compile(host_function_a, "arg0", stream="stream0")
+    result_b = cutez_module.compile(host_function_b, "arg0", stream="stream0")
+
+    assert result_a == "compiled:a:32"
+    assert result_b == "compiled:b:32"
+    assert [call[0].kwargs for call in compile_calls] == [
+        {"source": "a", "m": 7, "tile": 16},
+        {"source": "a", "m": 7, "tile": 32},
+        {"source": "b", "m": 7, "tile": 16},
+        {"source": "b", "m": 7, "tile": 32},
+    ]
+    assert [call[0] for call in benchmark_calls] == [
+        "compiled:a:16",
+        "compiled:a:32",
+        "compiled:b:16",
+        "compiled:b:32",
+    ]
+
+
 def test_compile_compiles_and_benchmarks_every_config_and_returns_fastest_candidate(
     cutez_module, monkeypatch
 ):
