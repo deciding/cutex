@@ -513,6 +513,101 @@ def test_compile_raises_autotune_error_when_all_candidates_fail(
     assert "tile 32" in message
 
 
+def test_compile_does_not_swallow_pre_hook_failures(cutez_module, monkeypatch):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        return f"compiled:{candidate_kernel.tile}"
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+
+    class Kernel:
+        def __init__(self, m, tile):
+            self.m = m
+            self.tile = tile
+
+        def autotune_init_kwargs(self):
+            return {"m": self.m, "tile": self.tile}
+
+        def autotune_key_values(self, *args, **kwargs):
+            return {"m": self.m}
+
+        @cutez_module.autotune(
+            configs=[
+                cutez_module.Config(
+                    kwargs={"tile": 16},
+                    pre_hook=lambda candidate, *a, **k: (_ for _ in ()).throw(
+                        RuntimeError("pre hook failed")
+                    ),
+                ),
+                cutez_module.Config(kwargs={"tile": 32}, name="working"),
+            ],
+            key=["m"],
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    with pytest.raises(RuntimeError, match="pre hook failed") as exc_info:
+        cutez_module.compile(Kernel(7, 0), "arg0", stream="stream0")
+
+    assert exc_info.type is RuntimeError
+
+
+def test_compile_does_not_swallow_do_bench_failures(cutez_module, monkeypatch):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        return f"compiled:{candidate_kernel.tile}"
+
+    def failing_do_bench(compiled_kernel, *args, **kwargs):
+        raise RuntimeError(f"benchmark failed for {compiled_kernel}")
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+
+    class Kernel:
+        def __init__(self, m, tile):
+            self.m = m
+            self.tile = tile
+
+        def autotune_init_kwargs(self):
+            return {"m": self.m, "tile": self.tile}
+
+        def autotune_key_values(self, *args, **kwargs):
+            return {"m": self.m}
+
+        @cutez_module.autotune(
+            configs=[
+                cutez_module.Config(kwargs={"tile": 16}, name="broken_bench"),
+                cutez_module.Config(kwargs={"tile": 32}, name="working"),
+            ],
+            key=["m"],
+            do_bench=failing_do_bench,
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    with pytest.raises(
+        RuntimeError, match="benchmark failed for compiled:16"
+    ) as exc_info:
+        cutez_module.compile(Kernel(7, 0), "arg0", stream="stream0")
+
+    assert exc_info.type is RuntimeError
+
+
 def test_compile_caches_best_config_by_tuning_key(cutez_module, monkeypatch):
     compiler_module = importlib.import_module("cutez.compiler")
     autotune_module = importlib.import_module("cutez.autotune")

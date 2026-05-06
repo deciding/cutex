@@ -52,18 +52,19 @@ def _compile_cache_key(kernel, candidate_kwargs, config, args, kwargs):
     )
 
 
-def _compile_candidate(kernel, candidate_kwargs, config, args, kwargs):
+def _get_cached_compiled_candidate(kernel, candidate_kwargs, config, args, kwargs):
     cache_key = _compile_cache_key(kernel, candidate_kwargs, config, args, kwargs)
-    cached = _COMPILE_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    return _COMPILE_CACHE.get(cache_key), cache_key
 
-    candidate_kernel = type(kernel)(**candidate_kwargs)
-    if config.pre_hook is not None:
-        config.pre_hook(candidate_kernel, *args, **kwargs)
+
+def _compile_candidate(candidate_kernel, cache_key, args, kwargs):
     compiled = cute.compile(candidate_kernel, *args, **kwargs)
     _COMPILE_CACHE[cache_key] = compiled
     return compiled
+
+
+def _reconstruct_candidate(kernel, candidate_kwargs):
+    return type(kernel)(**candidate_kwargs)
 
 
 def compile(kernel, *args, **kwargs):
@@ -78,9 +79,16 @@ def compile(kernel, *args, **kwargs):
         cached_best = _BEST_CONFIG_CACHE.get(tuning_key) if spec.cache_results else None
         if cached_best is not None:
             best_config, best_candidate_kwargs = cached_best
-            return _compile_candidate(
+            cached_compiled, cache_key = _get_cached_compiled_candidate(
                 kernel, best_candidate_kwargs, best_config, args, kwargs
             )
+            if cached_compiled is not None:
+                return cached_compiled
+
+            candidate_kernel = _reconstruct_candidate(kernel, best_candidate_kwargs)
+            if best_config.pre_hook is not None:
+                best_config.pre_hook(candidate_kernel, *args, **kwargs)
+            return _compile_candidate(candidate_kernel, cache_key, args, kwargs)
 
         best_compiled = None
         best_time = None
@@ -89,16 +97,31 @@ def compile(kernel, *args, **kwargs):
         failures = []
         for config in spec.configs:
             candidate_kwargs = _candidate_kwargs(kernel, runtime_key_values, config)
-            try:
-                compiled = _compile_candidate(
-                    kernel, candidate_kwargs, config, args, kwargs
-                )
-                timed = do_bench(
-                    compiled, *args, warmup=spec.warmup, rep=spec.rep, **kwargs
-                )
-            except Exception as exc:
-                failures.append((_config_label(config), exc))
-                continue
+            cached_compiled, cache_key = _get_cached_compiled_candidate(
+                kernel, candidate_kwargs, config, args, kwargs
+            )
+            if cached_compiled is not None:
+                compiled = cached_compiled
+            else:
+                try:
+                    candidate_kernel = _reconstruct_candidate(kernel, candidate_kwargs)
+                except Exception as exc:
+                    failures.append((_config_label(config), exc))
+                    continue
+
+                if config.pre_hook is not None:
+                    config.pre_hook(candidate_kernel, *args, **kwargs)
+
+                try:
+                    compiled = _compile_candidate(
+                        candidate_kernel, cache_key, args, kwargs
+                    )
+                except Exception as exc:
+                    failures.append((_config_label(config), exc))
+                    continue
+            timed = do_bench(
+                compiled, *args, warmup=spec.warmup, rep=spec.rep, **kwargs
+            )
             if best_time is None or timed < best_time:
                 best_time = timed
                 best_compiled = compiled
