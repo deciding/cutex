@@ -95,6 +95,12 @@ def _compile_target_and_kwargs(kernel, candidate_kwargs, kwargs):
     return _reconstruct_candidate(kernel, candidate_kwargs), kwargs
 
 
+def _pre_hook_kwargs(kernel, candidate_kwargs, kwargs):
+    if inspect.isfunction(kernel):
+        return {**kwargs, **candidate_kwargs}
+    return kwargs
+
+
 def _benchmark_args_and_kwargs(kernel, compiled, args, kwargs):
     if not inspect.isfunction(kernel) or not callable(compiled):
         return args, kwargs
@@ -159,7 +165,11 @@ def compile(kernel, *args, **kwargs):
                 kernel, best_candidate_kwargs, kwargs
             )
             if best_config.pre_hook is not None:
-                best_config.pre_hook(candidate_kernel, *args, **kwargs)
+                best_config.pre_hook(
+                    candidate_kernel,
+                    *args,
+                    **_pre_hook_kwargs(kernel, best_candidate_kwargs, kwargs),
+                )
             return _compile_candidate(candidate_kernel, cache_key, args, compile_kwargs)
 
         best_compiled = None
@@ -184,7 +194,11 @@ def compile(kernel, *args, **kwargs):
                     continue
 
                 if config.pre_hook is not None:
-                    config.pre_hook(candidate_kernel, *args, **kwargs)
+                    config.pre_hook(
+                        candidate_kernel,
+                        *args,
+                        **_pre_hook_kwargs(kernel, candidate_kwargs, kwargs),
+                    )
 
                 try:
                     compiled = _compile_candidate(

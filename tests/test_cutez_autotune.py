@@ -359,6 +359,42 @@ def test_compile_passes_runtime_args_and_autotune_kwargs_for_plain_host_function
     assert [call[0] for call in benchmark_calls] == ["compiled:16", "compiled:32"]
 
 
+def test_default_benchmark_returns_numeric_timing_for_none_returning_callables(
+    cutez_module, monkeypatch
+):
+    benchmark_module = importlib.import_module("cutez.benchmark")
+    calls = []
+    perf_counter_calls = []
+
+    def fake_perf_counter_ns():
+        value = {
+            0: 0,
+            1: 500,
+            2: 500,
+            3: 600,
+        }[len(perf_counter_calls)]
+        perf_counter_calls.append(value)
+        return value
+
+    monkeypatch.setattr(
+        benchmark_module, "perf_counter_ns", fake_perf_counter_ns, raising=False
+    )
+
+    def compiled_runtime(*args, **kwargs):
+        calls.append((args, kwargs))
+        return None
+
+    timed = benchmark_module.benchmark(
+        compiled_runtime, "abcdef", stream="stream0", rep=2
+    )
+
+    assert timed == 100
+    assert calls == [
+        (("abcdef",), {"stream": "stream0"}),
+        (("abcdef",), {"stream": "stream0"}),
+    ]
+
+
 def test_compile_benchmarks_plain_host_functions_without_constexpr_positional_args(
     cutez_module, monkeypatch
 ):
@@ -402,6 +438,46 @@ def test_compile_benchmarks_plain_host_functions_without_constexpr_positional_ar
     assert len(benchmark_calls) == 1
     assert benchmark_calls[0][1] == ("aa", "bbb")
     assert benchmark_calls[0][2] == {"stream": "stream0", "warmup": 0, "rep": 0}
+
+
+def test_compile_passes_candidate_meta_kwargs_to_plain_function_pre_hook(
+    cutez_module, monkeypatch
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    pre_hook_calls = []
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        return f"compiled:{kwargs['tile']}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        return {"compiled:16": 2.0, "compiled:32": 1.0}[compiled_kernel]
+
+    def pre_hook(candidate_kernel, *args, **kwargs):
+        pre_hook_calls.append((candidate_kernel, args, kwargs))
+
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+
+    @cutez_module.autotune(
+        configs=[
+            cutez_module.Config(kwargs={"tile": 16}, pre_hook=pre_hook),
+            cutez_module.Config(kwargs={"tile": 32}, pre_hook=pre_hook),
+        ],
+        key=["m"],
+    )
+    def host_function(a, stream, m, tile):
+        return (a, stream, m, tile)
+
+    host_function.autotune_init_kwargs = lambda: {"m": 0, "tile": 0}
+    host_function.autotune_key_values = lambda a, **kwargs: {"m": len(a)}
+
+    result = cutez_module.compile(host_function, "abcdef", stream="stream0")
+
+    assert result == "compiled:32"
+    assert [call[2] for call in pre_hook_calls] == [
+        {"stream": "stream0", "m": 6, "tile": 16},
+        {"stream": "stream0", "m": 6, "tile": 32},
+    ]
 
 
 def test_compile_benchmarks_plain_host_functions_without_compile_time_kwargs(
