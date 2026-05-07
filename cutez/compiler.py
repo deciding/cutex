@@ -124,7 +124,7 @@ def _benchmark_args_and_kwargs(kernel, compiled, args, kwargs):
             continue
 
         if arg_index >= len(args):
-            break
+            continue
 
         if is_compile_time:
             arg_index += 1
