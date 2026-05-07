@@ -100,22 +100,39 @@ def _benchmark_args_and_kwargs(kernel, compiled, args, kwargs):
         return args, kwargs
 
     kernel_signature = inspect.signature(kernel)
+    runtime_kwargs = {}
     runtime_args = []
     arg_index = 0
     for param in kernel_signature.parameters.values():
+        annotation_name = getattr(param.annotation, "__name__", None)
+        is_compile_time = (
+            annotation_name == "Constexpr"
+            or param.name in kernel.autotune_init_kwargs()
+        )
+
+        if param.kind == param.KEYWORD_ONLY:
+            if param.name in kwargs and not is_compile_time:
+                runtime_kwargs[param.name] = kwargs[param.name]
+            continue
+
         if param.kind not in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
             continue
+
+        if param.name in kwargs:
+            if not is_compile_time:
+                runtime_kwargs[param.name] = kwargs[param.name]
+            continue
+
         if arg_index >= len(args):
             break
-        annotation_name = getattr(param.annotation, "__name__", None)
-        if annotation_name == "Constexpr":
+
+        if is_compile_time:
             arg_index += 1
             continue
-        if param.name in kernel.autotune_init_kwargs():
-            continue
+
         runtime_args.append(args[arg_index])
         arg_index += 1
-    return tuple(runtime_args), kwargs
+    return tuple(runtime_args), runtime_kwargs
 
 
 def compile(kernel, *args, **kwargs):
