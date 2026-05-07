@@ -61,7 +61,6 @@ cluster_shape_mn = (2, 1)
 
 AUTOTUNE_CONFIGS = [
     cutez.Config(kwargs={"mma_tiler_mn": (256, 256), "cluster_shape_mn": (2, 1)}),
-    cutez.Config(kwargs={"mma_tiler_mn": (128, 256), "cluster_shape_mn": (2, 1)}),
 ]
 
 
