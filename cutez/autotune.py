@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import inspect
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 
@@ -17,6 +18,7 @@ class AutotuneSpec:
     warmup: int = 0
     rep: int = 0
     cache_results: bool = True
+    cache_path: Path | None = None
     do_bench: Callable[..., Any] | None = None
 
 
@@ -31,6 +33,7 @@ def autotune(
     warmup: int = 0,
     rep: int = 0,
     cache_results: bool = True,
+    cache_path: Path | None = None,
     do_bench: Callable[..., Any] | None = None,
 ):
     if not configs:
@@ -42,6 +45,7 @@ def autotune(
         warmup=warmup,
         rep=rep,
         cache_results=cache_results,
+        cache_path=cache_path,
         do_bench=do_bench,
     )
 

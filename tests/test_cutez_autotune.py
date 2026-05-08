@@ -38,6 +38,25 @@ def test_autotune_decorator_stores_normalized_metadata(cutez_module):
     assert spec.configs[0].pre_hook is pre_hook
 
 
+def test_autotune_decorator_stores_optional_cache_path_metadata(cutez_module):
+    autotune_module = importlib.import_module("cutez.autotune")
+    cache_path = Path(".cutez/autotune-cache.json")
+
+    class Kernel:
+        @cutez_module.autotune(
+            configs=[cutez_module.Config(kwargs={"tile": 128})],
+            key=["m"],
+            cache_path=cache_path,
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    spec = autotune_module.get_autotune_spec(Kernel())
+
+    assert spec is not None
+    assert spec.cache_path == cache_path
+
+
 def test_autotune_decorator_rejects_empty_config_lists(cutez_module):
     with pytest.raises(ValueError, match="at least one config"):
 
