@@ -40,7 +40,7 @@ def test_autotune_decorator_stores_normalized_metadata(cutez_module):
 
 def test_autotune_decorator_stores_optional_cache_path_metadata(cutez_module):
     autotune_module = importlib.import_module("cutez.autotune")
-    cache_path = Path(".cutez/autotune-cache.json")
+    cache_path = ".cutez/autotune-cache.json"
 
     class Kernel:
         @cutez_module.autotune(
@@ -54,7 +54,8 @@ def test_autotune_decorator_stores_optional_cache_path_metadata(cutez_module):
     spec = autotune_module.get_autotune_spec(Kernel())
 
     assert spec is not None
-    assert spec.cache_path == cache_path
+    assert spec.cache_path == Path(cache_path)
+    assert isinstance(spec.cache_path, Path)
 
 
 def test_autotune_decorator_rejects_empty_config_lists(cutez_module):

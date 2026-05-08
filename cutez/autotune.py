@@ -39,13 +39,15 @@ def autotune(
     if not configs:
         raise ValueError("autotune requires at least one config")
 
+    normalized_cache_path = None if cache_path is None else Path(cache_path)
+
     spec = AutotuneSpec(
         configs=tuple(configs),
         key=tuple(key),
         warmup=warmup,
         rep=rep,
         cache_results=cache_results,
-        cache_path=cache_path,
+        cache_path=normalized_cache_path,
         do_bench=do_bench,
     )
 
