@@ -11,6 +11,9 @@ class Config:
     name: str | None = None
     pre_hook: Callable[..., Any] | None = None
 
+    def __post_init__(self):
+        object.__setattr__(self, "kwargs", _normalize_config_value(self.kwargs))
+
 
 @dataclass(frozen=True)
 class AutotuneSpec:
@@ -84,6 +87,41 @@ def config_identity(config: Config) -> tuple[tuple[str, Any], ...]:
         ("name", freeze_for_cache(config.name)),
         ("pre_hook", freeze_for_cache(config.pre_hook)),
     )
+
+
+def _normalize_config_value(value):
+    return _normalize_config_value_impl(value, seen=set())
+
+
+def _normalize_config_value_impl(value, seen):
+    if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in seen:
+            return value
+        seen.add(value_id)
+        try:
+            return {k: _normalize_config_value_impl(v, seen) for k, v in value.items()}
+        finally:
+            seen.remove(value_id)
+    if isinstance(value, list):
+        value_id = id(value)
+        if value_id in seen:
+            return value
+        seen.add(value_id)
+        try:
+            return tuple(_normalize_config_value_impl(item, seen) for item in value)
+        finally:
+            seen.remove(value_id)
+    if isinstance(value, tuple):
+        value_id = id(value)
+        if value_id in seen:
+            return value
+        seen.add(value_id)
+        try:
+            return tuple(_normalize_config_value_impl(item, seen) for item in value)
+        finally:
+            seen.remove(value_id)
+    return value
 
 
 def freeze_for_cache(value):

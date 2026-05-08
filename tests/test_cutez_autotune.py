@@ -67,6 +67,14 @@ def test_autotune_decorator_accepts_path_like_cache_path_annotation(cutez_module
     assert cache_path_hint == str | PathLike[str] | None
 
 
+def test_config_normalizes_list_valued_kwargs_to_tuples(cutez_module):
+    config = cutez_module.Config(
+        kwargs={"shape": [16, 32], "nested": {"tile": [64, 128]}}
+    )
+
+    assert config.kwargs == {"shape": (16, 32), "nested": {"tile": (64, 128)}}
+
+
 def test_autotune_decorator_rejects_empty_config_lists(cutez_module):
     with pytest.raises(ValueError, match="at least one config"):
 
