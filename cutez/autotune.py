@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 import inspect
+from os import PathLike
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 
@@ -9,6 +11,9 @@ class Config:
     name: str | None = None
     pre_hook: Callable[..., Any] | None = None
 
+    def __post_init__(self):
+        object.__setattr__(self, "kwargs", _normalize_config_value(self.kwargs))
+
 
 @dataclass(frozen=True)
 class AutotuneSpec:
@@ -17,6 +22,7 @@ class AutotuneSpec:
     warmup: int = 0
     rep: int = 0
     cache_results: bool = True
+    cache_path: Path | None = None
     do_bench: Callable[..., Any] | None = None
 
 
@@ -31,10 +37,13 @@ def autotune(
     warmup: int = 0,
     rep: int = 0,
     cache_results: bool = True,
+    cache_path: str | PathLike[str] | None = None,
     do_bench: Callable[..., Any] | None = None,
 ):
     if not configs:
         raise ValueError("autotune requires at least one config")
+
+    normalized_cache_path = None if cache_path is None else Path(cache_path)
 
     spec = AutotuneSpec(
         configs=tuple(configs),
@@ -42,6 +51,7 @@ def autotune(
         warmup=warmup,
         rep=rep,
         cache_results=cache_results,
+        cache_path=normalized_cache_path,
         do_bench=do_bench,
     )
 
@@ -77,6 +87,41 @@ def config_identity(config: Config) -> tuple[tuple[str, Any], ...]:
         ("name", freeze_for_cache(config.name)),
         ("pre_hook", freeze_for_cache(config.pre_hook)),
     )
+
+
+def _normalize_config_value(value):
+    return _normalize_config_value_impl(value, seen=set())
+
+
+def _normalize_config_value_impl(value, seen):
+    if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in seen:
+            return value
+        seen.add(value_id)
+        try:
+            return {k: _normalize_config_value_impl(v, seen) for k, v in value.items()}
+        finally:
+            seen.remove(value_id)
+    if isinstance(value, list):
+        value_id = id(value)
+        if value_id in seen:
+            return value
+        seen.add(value_id)
+        try:
+            return tuple(_normalize_config_value_impl(item, seen) for item in value)
+        finally:
+            seen.remove(value_id)
+    if isinstance(value, tuple):
+        value_id = id(value)
+        if value_id in seen:
+            return value
+        seen.add(value_id)
+        try:
+            return tuple(_normalize_config_value_impl(item, seen) for item in value)
+        finally:
+            seen.remove(value_id)
+    return value
 
 
 def freeze_for_cache(value):
