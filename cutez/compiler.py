@@ -188,12 +188,8 @@ def _load_persisted_best_config(kernel, spec, runtime_key_values, tuning_key):
     return None, had_read_error
 
 
-def _persist_best_config(
-    kernel, spec, runtime_key_values, best_config, *, skip_write=False
-):
+def _persist_best_config(kernel, spec, runtime_key_values, best_config):
     if not _persistent_cache_enabled(spec):
-        return
-    if skip_write:
         return
 
     kernel_id = _stable_kernel_identifier(kernel)
@@ -211,7 +207,7 @@ def _persist_best_config(
 
     persisted_entries, had_read_error = _load_persistent_entries(spec.cache_path)
     if had_read_error:
-        return
+        persisted_entries = []
 
     entries = [
         existing
@@ -240,9 +236,8 @@ def compile(kernel, *args, **kwargs):
 
         cached_best = _BEST_CONFIG_CACHE.get(tuning_key) if spec.cache_results else None
         loaded_from_disk = False
-        skip_persist_for_call = False
         if cached_best is None:
-            cached_best, skip_persist_for_call = _load_persisted_best_config(
+            cached_best, _ = _load_persisted_best_config(
                 kernel, spec, runtime_key_values, tuning_key
             )
             loaded_from_disk = cached_best is not None
@@ -253,7 +248,10 @@ def compile(kernel, *args, **kwargs):
             )
             if cached_compiled is not None:
                 if loaded_from_disk:
-                    _log_verbose(kwargs, "disk-cache-hit")
+                    _log_verbose(
+                        kwargs,
+                        "disk-cache-hit: loaded best config from persistent cache",
+                    )
                 else:
                     _log_verbose(kwargs, "cache-hit")
                 return cached_compiled
@@ -262,7 +260,10 @@ def compile(kernel, *args, **kwargs):
             if best_config.pre_hook is not None:
                 best_config.pre_hook(candidate_kernel, *args, **kwargs)
             if loaded_from_disk:
-                _log_verbose(kwargs, "disk-cache-hit")
+                _log_verbose(
+                    kwargs,
+                    "disk-cache-hit: loaded best config from persistent cache",
+                )
             return _compile_candidate(candidate_kernel, cache_key, args, kwargs)
 
         best_compiled = None
@@ -312,13 +313,7 @@ def compile(kernel, *args, **kwargs):
 
         if spec.cache_results and best_config is not None:
             _BEST_CONFIG_CACHE[tuning_key] = (best_config, best_candidate_kwargs)
-            _persist_best_config(
-                kernel,
-                spec,
-                runtime_key_values,
-                best_config,
-                skip_write=skip_persist_for_call,
-            )
+            _persist_best_config(kernel, spec, runtime_key_values, best_config)
 
         return best_compiled
     return cute.compile(kernel, *args, **kwargs)

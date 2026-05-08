@@ -1152,7 +1152,7 @@ def test_compile_skips_disk_persistence_when_any_config_has_pre_hook(
     assert not cache_path.exists()
 
 
-def test_compile_ignores_malformed_disk_cache_and_rebuilds_in_memory(
+def test_compile_heals_malformed_disk_cache_after_successful_retune(
     cutez_module, monkeypatch, tmp_path
 ):
     compiler_module = importlib.import_module("cutez.compiler")
@@ -1207,13 +1207,31 @@ def test_compile_ignores_malformed_disk_cache_and_rebuilds_in_memory(
     assert result == "compiled:32"
     assert compile_calls == [16, 32]
     assert benchmark_calls == ["compiled:16", "compiled:32"]
-    assert cache_path.read_text() == "{not valid json"
+    assert cache_path.read_text() == (
+        "{\n"
+        '  "entries": [\n'
+        "    {\n"
+        '      "kernel": "test_cutez_autotune.'
+        'test_compile_heals_malformed_disk_cache_after_successful_retune.<locals>.Kernel.__call__",\n'
+        '      "key": [\n'
+        "        7\n"
+        "      ],\n"
+        '      "config": {\n'
+        '        "kwargs": {\n'
+        '          "tile": 32\n'
+        "        },\n"
+        '        "name": "fast"\n'
+        "      }\n"
+        "    }\n"
+        "  ]\n"
+        "}"
+    )
     assert compiler_module._BEST_CONFIG_CACHE[(Kernel, (7,))][0] == cutez_module.Config(
         kwargs={"tile": 32}, name="fast", pre_hook=None
     )
 
 
-def test_compile_reports_verbose_disk_cache_hits_distinctly_from_memory_hits(
+def test_compile_reports_verbose_disk_loaded_best_config_when_compile_cache_is_warm(
     cutez_module, monkeypatch, tmp_path, capsys
 ):
     compiler_module = importlib.import_module("cutez.compiler")
@@ -1225,7 +1243,7 @@ def test_compile_reports_verbose_disk_cache_hits_distinctly_from_memory_hits(
         '  "entries": [\n'
         "    {\n"
         '      "kernel": "test_cutez_autotune.'
-        'test_compile_reports_verbose_disk_cache_hits_distinctly_from_memory_hits.<locals>.Kernel.__call__",\n'
+        'test_compile_reports_verbose_disk_loaded_best_config_when_compile_cache_is_warm.<locals>.Kernel.__call__",\n'
         '      "key": [\n'
         "        7\n"
         "      ],\n"
@@ -1293,8 +1311,7 @@ def test_compile_reports_verbose_disk_cache_hits_distinctly_from_memory_hits(
     assert first == "compiled:32"
     assert second == "compiled:32"
     assert compile_calls == [32]
-    assert "disk-cache-hit" in first_output
-    assert "cache-hit" not in first_output.replace("disk-cache-hit", "")
+    assert first_output == "disk-cache-hit: loaded best config from persistent cache\n"
     assert "cache-hit" in second_output
     assert "disk-cache-hit" not in second_output
 
