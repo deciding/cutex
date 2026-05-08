@@ -141,6 +141,21 @@ def _persisted_config_from_entry(entry):
     return Config(kwargs=kwargs, name=name, pre_hook=None)
 
 
+def _config_is_in_spec(config, spec):
+    return any(
+        config.kwargs == current.kwargs and config.name == current.name
+        for current in spec.configs
+    )
+
+
+def _is_json_serializable(value):
+    try:
+        json.dumps(value)
+    except TypeError:
+        return False
+    return True
+
+
 def _load_persisted_best_config(kernel, spec, runtime_key_values, tuning_key):
     if not _persistent_cache_enabled(spec):
         return None
@@ -155,6 +170,8 @@ def _load_persisted_best_config(kernel, spec, runtime_key_values, tuning_key):
             continue
         config = _persisted_config_from_entry(entry)
         if config is None:
+            return None
+        if not _config_is_in_spec(config, spec):
             return None
         candidate_kwargs = _candidate_kwargs(kernel, runtime_key_values, config)
         cached_best = (config, candidate_kwargs)
@@ -177,6 +194,8 @@ def _persist_best_config(kernel, spec, runtime_key_values, best_config):
         "key": [runtime_key_values[name] for name in spec.key],
         "config": persisted_config,
     }
+    if not _is_json_serializable(entry):
+        return
 
     entries = [
         existing
@@ -190,7 +209,7 @@ def _persist_best_config(kernel, spec, runtime_key_values, best_config):
     try:
         spec.cache_path.parent.mkdir(parents=True, exist_ok=True)
         spec.cache_path.write_text(json.dumps({"entries": entries}, indent=2))
-    except OSError:
+    except (OSError, TypeError):
         return
 
 
