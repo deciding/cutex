@@ -142,6 +142,7 @@ def _benchmark_args_and_kwargs(kernel, compiled, args, kwargs):
 
 
 def compile(kernel, *args, **kwargs):
+    verbose = kwargs.pop("verbose", False)
     spec = read_autotune_spec(kernel)
     if spec is not None and (
         inspect.isfunction(kernel) or autotune_spec_applies_to_call(kernel, spec)
@@ -155,6 +156,10 @@ def compile(kernel, *args, **kwargs):
         cached_best = _BEST_CONFIG_CACHE.get(tuning_key) if spec.cache_results else None
         if cached_best is not None:
             best_config, best_candidate_kwargs = cached_best
+            if verbose:
+                print(
+                    f"[cutez.autotune] cache_hit key={tuning_key[1]} best_config={best_config.kwargs}"
+                )
             cached_compiled, cache_key = _get_cached_compiled_candidate(
                 kernel, best_candidate_kwargs, best_config, args, kwargs
             )
@@ -218,6 +223,8 @@ def compile(kernel, *args, **kwargs):
                     rep=spec.rep,
                     **bench_kwargs,
                 )
+                if verbose:
+                    print(f"[cutez.autotune] config={config.kwargs} time={timed}")
             except Exception as exc:
                 failures.append((_config_label(config), exc))
                 continue
@@ -229,6 +236,11 @@ def compile(kernel, *args, **kwargs):
 
         if best_config is None:
             raise AutotuneError(_format_candidate_failures(failures))
+
+        if verbose:
+            print(
+                f"[cutez.autotune] best_config={best_config.kwargs} best_time={best_time}"
+            )
 
         if spec.cache_results and best_config is not None:
             _BEST_CONFIG_CACHE[tuning_key] = (best_config, best_candidate_kwargs)

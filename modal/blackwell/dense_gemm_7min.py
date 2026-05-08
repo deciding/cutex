@@ -53,23 +53,16 @@ epilog_sync_bar_id = 1
 tmem_alloc_sync_bar_id = 2
 tmem_dealloc_sync_bar_id = 3
 
-ab_stages = 6
+#ab_stages = 6
 acc_stage = 1
 num_c_stage = 2
 
 cluster_shape_mn = (2, 1)
 
 AUTOTUNE_CONFIGS = [
-    cutez.Config(kwargs={"mma_tiler_mn": (256, 256), "cluster_shape_mn": (2, 1)}),
+        cutez.Config(kwargs={"mma_tiler_mn": (256, 256), "cluster_shape_mn": (2, 1), "ab_stages": ab_stages,})
+        for ab_stages in (6, 7, 8)
 ]
-
-
-@cute.struct
-class SharedStorage:
-    ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, ab_stages * 2]
-    acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, acc_stage * 2]
-    tmem_dealloc_mbar_ptr: cutlass.Int64
-    tmem_holding_buf: cutlass.Int32
 
 
 @cute.kernel
@@ -95,6 +88,7 @@ def kernel(
     tma_atom_c,
     mC_mn: cute.Tensor,
     tile_sched_params: utils.PersistentTileSchedulerParams,
+    ab_stages: cutlass.Constexpr,
 ):
 
     # coords
@@ -111,6 +105,12 @@ def kernel(
     is_leader_cta = mma_tile_coord_v == 0
 
     # smem
+    @cute.struct
+    class SharedStorage:
+        ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, ab_stages * 2]
+        acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, acc_stage * 2]
+        tmem_dealloc_mbar_ptr: cutlass.Int64
+        tmem_holding_buf: cutlass.Int32
 
     smem = cutlass.utils.SmemAllocator()
     storage = smem.allocate(SharedStorage)
@@ -516,6 +516,7 @@ def host_function(
     stream: cuda.CUstream,
     mma_tiler_mn: cutlass.Constexpr,
     cluster_shape_mn: cutlass.Constexpr,
+    ab_stages: cutlass.Constexpr,
 ):
     mma_tiler_mnk = (*mma_tiler_mn, mma_tile_k)
 
@@ -648,6 +649,7 @@ def host_function(
         tma_atom_c,
         tma_tensor_c,
         tile_sched_params,
+        ab_stages,
     ).launch(
         grid=grid_shape,
         block=(threads_per_cta, 1, 1),

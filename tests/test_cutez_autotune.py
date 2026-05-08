@@ -314,6 +314,86 @@ def test_compile_reuses_cached_plain_function_candidate_on_repeated_calls(
     assert [call[0] for call in benchmark_calls] == ["compiled:16", "compiled:32"]
 
 
+def test_compile_logs_candidates_only_when_verbose_true(
+    cutez_module, monkeypatch, capsys
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        return f"compiled:{kwargs['tile']}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        return {"compiled:16": 2.0, "compiled:32": 1.0}[compiled_kernel]
+
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+
+    @cutez_module.autotune(
+        configs=[
+            cutez_module.Config(kwargs={"tile": 16}),
+            cutez_module.Config(kwargs={"tile": 32}),
+        ],
+        key=["m"],
+        cache_results=False,
+    )
+    def host_function(m, tile):
+        return (m, tile)
+
+    host_function.autotune_init_kwargs = lambda: {"m": 0, "tile": 0}
+    host_function.autotune_key_values = lambda *args, **kwargs: {"m": 7}
+
+    cutez_module.compile(host_function, "arg0", stream="stream0")
+    quiet = capsys.readouterr()
+    assert quiet.out == ""
+
+    cutez_module.compile(host_function, "arg0", stream="stream0", verbose=True)
+    verbose = capsys.readouterr()
+    assert "[cutez.autotune] config={'tile': 16}" in verbose.out
+    assert "[cutez.autotune] config={'tile': 32}" in verbose.out
+    assert "[cutez.autotune] best_config={'tile': 32}" in verbose.out
+
+
+def test_compile_logs_cache_hit_only_when_verbose_true(
+    cutez_module, monkeypatch, capsys
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    compile_calls = []
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append((candidate_kernel, args, kwargs))
+        return f"compiled:{kwargs['tile']}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        return {"compiled:16": 2.0, "compiled:32": 1.0}[compiled_kernel]
+
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+
+    @cutez_module.autotune(
+        configs=[
+            cutez_module.Config(kwargs={"tile": 16}),
+            cutez_module.Config(kwargs={"tile": 32}),
+        ],
+        key=["m"],
+        cache_results=True,
+    )
+    def host_function(m, tile):
+        return (m, tile)
+
+    host_function.autotune_init_kwargs = lambda: {"m": 0, "tile": 0}
+    host_function.autotune_key_values = lambda *args, **kwargs: {"m": 7}
+
+    cutez_module.compile(host_function, "arg0", stream="stream0")
+    first = capsys.readouterr()
+    assert first.out == ""
+
+    cutez_module.compile(host_function, "arg0", stream="stream0", verbose=True)
+    second = capsys.readouterr()
+    assert "[cutez.autotune] cache_hit" in second.out
+    assert "best_config={'tile': 32}" in second.out
+    assert len(compile_calls) == 2
+
+
 def test_compile_passes_runtime_args_and_autotune_kwargs_for_plain_host_functions(
     cutez_module, monkeypatch
 ):
