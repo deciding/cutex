@@ -1,7 +1,10 @@
+import json
+
 import cutlass.cute as cute
 
 from .autotune import (
     AutotuneError,
+    Config,
     autotune_spec_applies_to_call,
     config_identity,
     freeze_for_cache,
@@ -76,6 +79,121 @@ def _reconstruct_candidate(kernel, candidate_kwargs):
     return type(kernel)(**candidate_kwargs)
 
 
+def _persistent_cache_enabled(spec):
+    return (
+        spec.cache_results
+        and spec.cache_path is not None
+        and all(config.pre_hook is None for config in spec.configs)
+    )
+
+
+def _stable_kernel_identifier(kernel):
+    target = (
+        kernel
+        if hasattr(kernel, "__module__") and hasattr(kernel, "__qualname__")
+        else None
+    )
+    if target is None:
+        target = getattr(type(kernel), "__call__", None)
+    if target is None:
+        return None
+
+    module = getattr(target, "__module__", None)
+    qualname = getattr(target, "__qualname__", None)
+    if not module or not qualname:
+        return None
+    return f"{module}.{qualname}"
+
+
+def _persisted_entry_matches(entry, kernel_id, tuning_values):
+    return (
+        isinstance(entry, dict)
+        and entry.get("kernel") == kernel_id
+        and entry.get("key") == list(tuning_values)
+    )
+
+
+def _load_persistent_entries(cache_path):
+    try:
+        payload = json.loads(cache_path.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return []
+
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        return []
+    return entries
+
+
+def _persisted_config_from_entry(entry):
+    config = entry.get("config")
+    if not isinstance(config, dict):
+        return None
+
+    kwargs = config.get("kwargs")
+    if not isinstance(kwargs, dict):
+        return None
+
+    name = config.get("name")
+    if name is not None and not isinstance(name, str):
+        return None
+
+    return Config(kwargs=kwargs, name=name, pre_hook=None)
+
+
+def _load_persisted_best_config(kernel, spec, runtime_key_values, tuning_key):
+    if not _persistent_cache_enabled(spec):
+        return None
+
+    kernel_id = _stable_kernel_identifier(kernel)
+    if kernel_id is None:
+        return None
+
+    tuning_values = tuple(runtime_key_values[name] for name in spec.key)
+    for entry in _load_persistent_entries(spec.cache_path):
+        if not _persisted_entry_matches(entry, kernel_id, tuning_values):
+            continue
+        config = _persisted_config_from_entry(entry)
+        if config is None:
+            return None
+        candidate_kwargs = _candidate_kwargs(kernel, runtime_key_values, config)
+        cached_best = (config, candidate_kwargs)
+        _BEST_CONFIG_CACHE[tuning_key] = cached_best
+        return cached_best
+    return None
+
+
+def _persist_best_config(kernel, spec, runtime_key_values, best_config):
+    if not _persistent_cache_enabled(spec):
+        return
+
+    kernel_id = _stable_kernel_identifier(kernel)
+    if kernel_id is None:
+        return
+
+    persisted_config = {"kwargs": dict(best_config.kwargs), "name": best_config.name}
+    entry = {
+        "kernel": kernel_id,
+        "key": [runtime_key_values[name] for name in spec.key],
+        "config": persisted_config,
+    }
+
+    entries = [
+        existing
+        for existing in _load_persistent_entries(spec.cache_path)
+        if not _persisted_entry_matches(
+            existing, kernel_id, tuple(runtime_key_values[name] for name in spec.key)
+        )
+    ]
+    entries.append(entry)
+
+    try:
+        spec.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        spec.cache_path.write_text(json.dumps({"entries": entries}, indent=2))
+    except OSError:
+        return
+
+
 def compile(kernel, *args, **kwargs):
     spec = read_autotune_spec(kernel)
     if autotune_spec_applies_to_call(kernel, spec):
@@ -86,6 +204,10 @@ def compile(kernel, *args, **kwargs):
         tuning_key = _tuning_key(kernel, spec, runtime_key_values)
 
         cached_best = _BEST_CONFIG_CACHE.get(tuning_key) if spec.cache_results else None
+        if cached_best is None:
+            cached_best = _load_persisted_best_config(
+                kernel, spec, runtime_key_values, tuning_key
+            )
         if cached_best is not None:
             best_config, best_candidate_kwargs = cached_best
             cached_compiled, cache_key = _get_cached_compiled_candidate(
@@ -146,6 +268,7 @@ def compile(kernel, *args, **kwargs):
 
         if spec.cache_results and best_config is not None:
             _BEST_CONFIG_CACHE[tuning_key] = (best_config, best_candidate_kwargs)
+            _persist_best_config(kernel, spec, runtime_key_values, best_config)
 
         return best_compiled
     return cute.compile(kernel, *args, **kwargs)
