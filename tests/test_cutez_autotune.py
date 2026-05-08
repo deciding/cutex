@@ -1,6 +1,8 @@
 from pathlib import Path
 import importlib
 import sys
+from os import PathLike
+from typing import get_type_hints
 
 import pytest
 
@@ -56,6 +58,12 @@ def test_autotune_decorator_stores_optional_cache_path_metadata(cutez_module):
     assert spec is not None
     assert spec.cache_path == Path(cache_path)
     assert isinstance(spec.cache_path, Path)
+
+
+def test_autotune_decorator_accepts_path_like_cache_path_annotation(cutez_module):
+    cache_path_hint = get_type_hints(cutez_module.autotune)["cache_path"]
+
+    assert cache_path_hint == str | PathLike[str] | None
 
 
 def test_autotune_decorator_rejects_empty_config_lists(cutez_module):

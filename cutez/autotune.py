@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import inspect
+from os import PathLike
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -33,7 +34,7 @@ def autotune(
     warmup: int = 0,
     rep: int = 0,
     cache_results: bool = True,
-    cache_path: Path | None = None,
+    cache_path: str | PathLike[str] | None = None,
     do_bench: Callable[..., Any] | None = None,
 ):
     if not configs:
