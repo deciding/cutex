@@ -1090,6 +1090,215 @@ def test_compile_skips_persisting_non_json_serializable_best_config(
     assert not cache_path.exists()
 
 
+def test_compile_skips_disk_persistence_when_any_config_has_pre_hook(
+    cutez_module, monkeypatch, tmp_path
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    compile_calls = []
+    benchmark_calls = []
+    cache_path = tmp_path / "best-configs.json"
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append(candidate_kernel.tile)
+        return f"compiled:{candidate_kernel.tile}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append(compiled_kernel)
+        return {"compiled:16": 2.0, "compiled:32": 1.0}[compiled_kernel]
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+
+    class Kernel:
+        def __init__(self, m, tile):
+            self.m = m
+            self.tile = tile
+
+        def autotune_init_kwargs(self):
+            return {"m": self.m, "tile": self.tile}
+
+        def autotune_key_values(self, *args, **kwargs):
+            return {"m": self.m}
+
+        @cutez_module.autotune(
+            configs=[
+                cutez_module.Config(
+                    kwargs={"tile": 16},
+                    name="slow",
+                    pre_hook=lambda candidate, *a, **k: setattr(
+                        candidate, "hook_marker", "slow"
+                    ),
+                ),
+                cutez_module.Config(kwargs={"tile": 32}, name="fast"),
+            ],
+            key=["m"],
+            cache_path=cache_path,
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    result = cutez_module.compile(Kernel(7, 0), "arg0", stream="stream0")
+
+    assert result == "compiled:32"
+    assert compile_calls == [16, 32]
+    assert benchmark_calls == ["compiled:16", "compiled:32"]
+    assert not cache_path.exists()
+
+
+def test_compile_ignores_malformed_disk_cache_and_rebuilds_in_memory(
+    cutez_module, monkeypatch, tmp_path
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    compile_calls = []
+    benchmark_calls = []
+    cache_path = tmp_path / "best-configs.json"
+    cache_path.write_text("{not valid json")
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append(candidate_kernel.tile)
+        return f"compiled:{candidate_kernel.tile}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append(compiled_kernel)
+        return {"compiled:16": 2.0, "compiled:32": 1.0}[compiled_kernel]
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+    compiler_module._BEST_CONFIG_CACHE.clear()
+
+    class Kernel:
+        def __init__(self, m, tile):
+            self.m = m
+            self.tile = tile
+
+        def autotune_init_kwargs(self):
+            return {"m": self.m, "tile": self.tile}
+
+        def autotune_key_values(self, *args, **kwargs):
+            return {"m": self.m}
+
+        @cutez_module.autotune(
+            configs=[
+                cutez_module.Config(kwargs={"tile": 16}, name="slow"),
+                cutez_module.Config(kwargs={"tile": 32}, name="fast"),
+            ],
+            key=["m"],
+            cache_path=cache_path,
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    result = cutez_module.compile(Kernel(7, 0), "arg0", stream="stream0")
+
+    assert result == "compiled:32"
+    assert compile_calls == [16, 32]
+    assert benchmark_calls == ["compiled:16", "compiled:32"]
+    assert cache_path.read_text() == "{not valid json"
+    assert compiler_module._BEST_CONFIG_CACHE[(Kernel, (7,))][0] == cutez_module.Config(
+        kwargs={"tile": 32}, name="fast", pre_hook=None
+    )
+
+
+def test_compile_reports_verbose_disk_cache_hits_distinctly_from_memory_hits(
+    cutez_module, monkeypatch, tmp_path, capsys
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    compile_calls = []
+    cache_path = tmp_path / "best-configs.json"
+    cache_path.write_text(
+        "{\n"
+        '  "entries": [\n'
+        "    {\n"
+        '      "kernel": "test_cutez_autotune.'
+        'test_compile_reports_verbose_disk_cache_hits_distinctly_from_memory_hits.<locals>.Kernel.__call__",\n'
+        '      "key": [\n'
+        "        7\n"
+        "      ],\n"
+        '      "config": {\n'
+        '        "kwargs": {\n'
+        '          "tile": 32\n'
+        "        },\n"
+        '        "name": "fast"\n'
+        "      }\n"
+        "    }\n"
+        "  ]\n"
+        "}"
+    )
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append(candidate_kernel.tile)
+        return f"compiled:{candidate_kernel.tile}"
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(
+        compiler_module,
+        "benchmark",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("benchmark should be skipped on cache hits")
+        ),
+        raising=False,
+    )
+    compiler_module._BEST_CONFIG_CACHE.clear()
+
+    class Kernel:
+        def __init__(self, m, tile):
+            self.m = m
+            self.tile = tile
+
+        def autotune_init_kwargs(self):
+            return {"m": self.m, "tile": self.tile}
+
+        def autotune_key_values(self, *args, **kwargs):
+            return {"m": self.m}
+
+        @cutez_module.autotune(
+            configs=[
+                cutez_module.Config(kwargs={"tile": 16}, name="slow"),
+                cutez_module.Config(kwargs={"tile": 32}, name="fast"),
+            ],
+            key=["m"],
+            cache_path=cache_path,
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    kernel = Kernel(7, 0)
+
+    first = cutez_module.compile(kernel, "arg0", stream="stream0", verbose=True)
+    first_output = capsys.readouterr().out
+    second = cutez_module.compile(kernel, "arg0", stream="stream0", verbose=True)
+    second_output = capsys.readouterr().out
+
+    assert first == "compiled:32"
+    assert second == "compiled:32"
+    assert compile_calls == [32]
+    assert "disk-cache-hit" in first_output
+    assert "cache-hit" not in first_output.replace("disk-cache-hit", "")
+    assert "cache-hit" in second_output
+    assert "disk-cache-hit" not in second_output
+
+
 def test_compile_reuses_compiled_candidates_across_tuning_keys(
     cutez_module, monkeypatch
 ):
