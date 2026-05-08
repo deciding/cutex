@@ -1,7 +1,8 @@
-from pathlib import Path
 import importlib
+import json
 import sys
 from os import PathLike
+from pathlib import Path
 from typing import get_type_hints
 
 import pytest
@@ -1074,6 +1075,211 @@ def test_compile_skips_persisting_non_json_serializable_best_config(
                 cutez_module.Config(kwargs={"tile": 16}, name="slow"),
                 cutez_module.Config(
                     kwargs={"tile": 32, "marker": object()}, name="fast"
+                ),
+            ],
+            key=["problem"],
+            cache_path=cache_path,
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    result = cutez_module.compile(Kernel(7, 0), "arg0", stream="stream0")
+
+    assert result == "compiled:32"
+    assert compile_calls == [16, 32]
+    assert benchmark_calls == ["compiled:16", "compiled:32"]
+    assert not cache_path.exists()
+
+
+def test_compile_reuses_persisted_best_config_with_tuple_keys_and_kwargs(
+    cutez_module, monkeypatch, tmp_path, capsys
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    compile_calls = []
+    benchmark_calls = []
+    cache_path = tmp_path / "best-configs.json"
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append(candidate_kernel.tile_shape)
+        return f"compiled:{candidate_kernel.tile_shape}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append(compiled_kernel)
+        return {
+            "compiled:(8, 8)": 2.0,
+            "compiled:(16, 16)": 1.0,
+        }[compiled_kernel]
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+    compiler_module._BEST_CONFIG_CACHE.clear()
+
+    class Kernel:
+        def __init__(self, problem_shape, tile_shape):
+            self.problem_shape = problem_shape
+            self.tile_shape = tile_shape
+
+        def autotune_init_kwargs(self):
+            return {
+                "problem_shape": self.problem_shape,
+                "tile_shape": self.tile_shape,
+            }
+
+        def autotune_key_values(self, *args, **kwargs):
+            return {"problem_shape": self.problem_shape}
+
+        @cutez_module.autotune(
+            configs=[
+                cutez_module.Config(kwargs={"tile_shape": (8, 8)}, name="slow"),
+                cutez_module.Config(kwargs={"tile_shape": (16, 16)}, name="fast"),
+            ],
+            key=["problem_shape"],
+            cache_path=cache_path,
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    first = cutez_module.compile(Kernel((64, 64), (0, 0)), "arg0", stream="stream0")
+    first_output = capsys.readouterr().out
+    compiler_module._BEST_CONFIG_CACHE.clear()
+    second = cutez_module.compile(
+        Kernel((64, 64), (0, 0)), "arg0", stream="stream0", verbose=True
+    )
+    second_output = capsys.readouterr().out
+
+    assert first == "compiled:(16, 16)"
+    assert second == "compiled:(16, 16)"
+    assert compile_calls == [(8, 8), (16, 16), (16, 16)]
+    assert benchmark_calls == ["compiled:(8, 8)", "compiled:(16, 16)"]
+    assert first_output == ""
+    assert second_output == "disk-cache-hit: loaded best config from persistent cache\n"
+
+
+def test_compile_treats_parseable_non_object_disk_cache_as_malformed(
+    cutez_module, monkeypatch, tmp_path
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    compile_calls = []
+    benchmark_calls = []
+    cache_path = tmp_path / "best-configs.json"
+    cache_path.write_text("[]")
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append(candidate_kernel.tile)
+        return f"compiled:{candidate_kernel.tile}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append(compiled_kernel)
+        return {"compiled:16": 2.0, "compiled:32": 1.0}[compiled_kernel]
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+    compiler_module._BEST_CONFIG_CACHE.clear()
+
+    class Kernel:
+        def __init__(self, m, tile):
+            self.m = m
+            self.tile = tile
+
+        def autotune_init_kwargs(self):
+            return {"m": self.m, "tile": self.tile}
+
+        def autotune_key_values(self, *args, **kwargs):
+            return {"m": self.m}
+
+        @cutez_module.autotune(
+            configs=[
+                cutez_module.Config(kwargs={"tile": 16}, name="slow"),
+                cutez_module.Config(kwargs={"tile": 32}, name="fast"),
+            ],
+            key=["m"],
+            cache_path=cache_path,
+        )
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    result = cutez_module.compile(Kernel(7, 0), "arg0", stream="stream0")
+
+    assert result == "compiled:32"
+    assert compile_calls == [16, 32]
+    assert benchmark_calls == ["compiled:16", "compiled:32"]
+    assert json.loads(cache_path.read_text()) == {
+        "entries": [
+            {
+                "kernel": f"{__name__}.{Kernel.__qualname__}.__call__",
+                "key": [7],
+                "config": {"kwargs": {"tile": 32}, "name": "fast"},
+            }
+        ]
+    }
+
+
+def test_compile_skips_persisting_circular_best_config_value(
+    cutez_module, monkeypatch, tmp_path
+):
+    compiler_module = importlib.import_module("cutez.compiler")
+    autotune_module = importlib.import_module("cutez.autotune")
+    compile_calls = []
+    benchmark_calls = []
+    cache_path = tmp_path / "best-configs.json"
+
+    def fake_read_autotune_spec(kernel):
+        return autotune_module.get_autotune_spec(kernel)
+
+    def fake_compile(candidate_kernel, *args, **kwargs):
+        compile_calls.append(candidate_kernel.tile)
+        return f"compiled:{candidate_kernel.tile}"
+
+    def fake_benchmark(compiled_kernel, *args, **kwargs):
+        benchmark_calls.append(compiled_kernel)
+        return {"compiled:16": 2.0, "compiled:32": 1.0}[compiled_kernel]
+
+    monkeypatch.setattr(
+        compiler_module, "read_autotune_spec", fake_read_autotune_spec, raising=False
+    )
+    monkeypatch.setattr(compiler_module.cute, "compile", fake_compile)
+    monkeypatch.setattr(compiler_module, "benchmark", fake_benchmark, raising=False)
+    monkeypatch.setattr(
+        compiler_module,
+        "_get_cached_compiled_candidate",
+        lambda *args, **kwargs: (None, object()),
+        raising=False,
+    )
+
+    circular_marker = []
+    circular_marker.append(circular_marker)
+
+    class Kernel:
+        def __init__(self, problem, tile, marker=None):
+            self.problem = problem
+            self.tile = tile
+            self.marker = marker
+
+        def autotune_init_kwargs(self):
+            return {"problem": self.problem, "tile": self.tile, "marker": self.marker}
+
+        def autotune_key_values(self, *args, **kwargs):
+            return {"problem": self.problem}
+
+        @cutez_module.autotune(
+            configs=[
+                cutez_module.Config(kwargs={"tile": 16}, name="slow"),
+                cutez_module.Config(
+                    kwargs={"tile": 32, "marker": circular_marker}, name="fast"
                 ),
             ],
             key=["problem"],

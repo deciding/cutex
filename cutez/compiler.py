@@ -110,11 +110,19 @@ def _stable_kernel_identifier(kernel):
     return f"{module}.{qualname}"
 
 
+def _normalize_persisted_value(value):
+    if isinstance(value, list):
+        return tuple(_normalize_persisted_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _normalize_persisted_value(item) for key, item in value.items()}
+    return value
+
+
 def _persisted_entry_matches(entry, kernel_id, tuning_values):
     return (
         isinstance(entry, dict)
         and entry.get("kernel") == kernel_id
-        and entry.get("key") == list(tuning_values)
+        and _normalize_persisted_value(entry.get("key")) == tuning_values
     )
 
 
@@ -126,9 +134,12 @@ def _load_persistent_entries(cache_path):
     except (OSError, json.JSONDecodeError):
         return [], True
 
+    if not isinstance(payload, dict):
+        return [], True
+
     entries = payload.get("entries")
     if not isinstance(entries, list):
-        return [], False
+        return [], True
     return entries, False
 
 
@@ -145,20 +156,20 @@ def _persisted_config_from_entry(entry):
     if name is not None and not isinstance(name, str):
         return None
 
-    return Config(kwargs=kwargs, name=name, pre_hook=None)
+    return Config(kwargs=_normalize_persisted_value(kwargs), name=name, pre_hook=None)
 
 
-def _config_is_in_spec(config, spec):
-    return any(
-        config.kwargs == current.kwargs and config.name == current.name
-        for current in spec.configs
-    )
+def _config_from_spec(config, spec):
+    for current in spec.configs:
+        if config.kwargs == current.kwargs and config.name == current.name:
+            return current
+    return None
 
 
 def _is_json_serializable(value):
     try:
         json.dumps(value)
-    except TypeError:
+    except (TypeError, ValueError):
         return False
     return True
 
@@ -179,7 +190,8 @@ def _load_persisted_best_config(kernel, spec, runtime_key_values, tuning_key):
         config = _persisted_config_from_entry(entry)
         if config is None:
             return None, had_read_error
-        if not _config_is_in_spec(config, spec):
+        config = _config_from_spec(config, spec)
+        if config is None:
             return None, had_read_error
         candidate_kwargs = _candidate_kwargs(kernel, runtime_key_values, config)
         cached_best = (config, candidate_kwargs)
@@ -221,7 +233,7 @@ def _persist_best_config(kernel, spec, runtime_key_values, best_config):
     try:
         spec.cache_path.parent.mkdir(parents=True, exist_ok=True)
         spec.cache_path.write_text(json.dumps({"entries": entries}, indent=2))
-    except (OSError, TypeError):
+    except (OSError, TypeError, ValueError):
         return
 
 
