@@ -506,7 +506,7 @@ def kernel(
 
 
 # tiled_mma, c_layout/epi_tile, smem_layouts, tma_atoms/tma_tensors, cluster/tile_scheduler/grid
-@cutez.autotune(configs=AUTOTUNE_CONFIGS, key=["m", "n", "k"])
+@cutez.autotune(configs=AUTOTUNE_CONFIGS, key=["m", "n", "k"],  cache_path='/workspace/dump/dense_gemm_7min.json')
 @cute.jit
 def host_function(
     a: cute.Tensor,
@@ -775,6 +775,7 @@ def run_dense_gemm(
         c_tensor,
         max_active_clusters,
         current_stream,
+        verbose=True,
     )
 
     def compare(a_torch_cpu, b_torch_cpu, c_torch_gpu, c_dtype, tolerance):
