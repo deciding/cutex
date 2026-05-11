@@ -1,4 +1,4 @@
-# cutex
+# cutez
 
 ## Install
 ```
